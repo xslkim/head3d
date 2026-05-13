@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+data/*.json
+data/*.png
+data/*.jpg
+!data/.gitkeep
+
+# Generated artifacts (track face_ext.obj since it's deterministic)
+# face_ext.obj is kept in repo
