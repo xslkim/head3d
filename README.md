@@ -1,58 +1,81 @@
-# head3d — MediaPipe Face Mesh with hairline extension
+# head3d - 带发际线扩展的 MediaPipe 3D 人脸网格
 
-Pipeline that takes a face photo and produces a 502-point 3D mesh extending
-**from the MediaPipe forehead boundary up to the real hairline**, so the
-existing Vulkan texture-overlay renderer can paint effects in the hairline
-area (decorative lines, painted-down hairline, etc.).
+这个项目把单张人脸照片转换成一个 **502 点 3D 人脸网格**。它保留 MediaPipe FaceMesh 原始的 468 个点不变，并在额头上沿额外追加 34 个点：
 
-The base 468 vertices are unchanged; we **append** 17 middle-row + 17 hairline
-vertices using a fixed topology, so the existing UV-driven shader pipeline
-keeps working without modification.
+- 17 个“中间行”点：位于 MediaPipe 额头上沿和真实发际线之间。
+- 17 个“发际线”点：贴近图片里识别到的头发边界。
 
-See [PLAN_hairline.md](PLAN_hairline.md) for the design rationale.
+这样做的目的，是让已有的 Vulkan 贴图渲染管线可以把特效画到额头和发际线区域，例如装饰线、下推发际线、发际线填充等。原来的 468 点、人脸拓扑和 UV 仍然可用；新增部分只是在网格顶部加一条额头扩展带。
 
-## Project layout
+设计背景见 [PLAN_hairline.md](PLAN_hairline.md)。C++ 接入说明见 [sdk/README.md](sdk/README.md)。
 
-```
+## 一句话流程
+
+输入一张照片后，程序会：
+
+1. 用 MediaPipe 找到人脸 468 个 3D landmark。
+2. 用 HuggingFace SegFormer 做人脸语义分割，得到每个像素属于皮肤、头发、帽子、五官等哪一类。
+3. 从 MediaPipe 额头上沿的 17 个锚点出发，沿“脸部向上”的方向逐像素找第一个 hair/hat 像素，这 17 个命中点就是 2D 发际线采样点。
+4. 把 2D 发际线点补上 Z 值，变成 17 个 3D 发际线点。
+5. 在 MediaPipe 上沿和发际线之间插值生成 17 个中间行点。
+6. 拼成 `468 + 17 + 17 = 502` 个点，输出 JSON，供 SDK 更新顶点缓冲。
+
+## 项目结构
+
+```text
 head3d/
-├── PLAN_hairline.md         # design doc
-├── README.md                # this file
-├── requirements.txt         # pip deps
-├── face.obj                 # original MediaPipe canonical mesh (468 v)
-├── face_ext.obj             # generated extended mesh (502 v, 916 tris)
+├── PLAN_hairline.md         # 中文设计文档，记录方案、阶段、风险和后续计划
+├── README.md                # 当前说明
+├── requirements.txt         # Python 依赖
+├── face.obj                 # 原始 MediaPipe canonical mesh，468 个顶点，852 个三角面
+├── face_ext.obj             # 生成后的扩展 mesh，502 个顶点，916 个三角面
 ├── python/
-│   ├── constants.py             # MP_TOP_ANCHORS, UV layout, parser classes
-│   ├── obj_io.py                # minimal OBJ reader/writer
-│   ├── face_landmarks.py        # MediaPipe FaceMesh wrapper
-│   ├── face_parsing.py          # HuggingFace SegFormer wrapper
-│   ├── hairline_2d.py           # ray-cast hairline detection
-│   ├── lift_3d.py               # 2D → 3D lifting
-│   ├── build_extended_obj.py    # generates face_ext.obj (one-time)
-│   ├── extract_hairline.py      # main CLI: image → 502-point JSON
-│   ├── visualize.py             # debug overlays
-│   └── _index_map_data.py       # auto-extracted indexMap from the SDK
+│   ├── constants.py             # 关键常量：17 个锚点、顶点布局、Z 偏移、UV、分割类别
+│   ├── obj_io.py                # 简单 OBJ 读写器
+│   ├── face_landmarks.py        # MediaPipe FaceLandmarker 封装，输出 468 个点
+│   ├── face_parsing.py          # HuggingFace SegFormer 人脸分割封装
+│   ├── hairline_2d.py           # 发际线 2D 识别：mask + 射线搜索 + 平滑 + 回退
+│   ├── lift_3d.py               # 2D 发际线点提升到 3D，并生成中间行
+│   ├── build_extended_obj.py    # 一次性生成 face_ext.obj
+│   ├── extract_hairline.py      # 主入口：图片 -> 502 点 JSON
+│   ├── visualize.py             # 调试可视化：分割、锚点射线、扩展网格
+│   └── _index_map_data.py       # 从 SDK 提取的 468 点 indexMap
 ├── sdk/
-│   ├── ExtensionConstants.h     # 502-entry indexMap + anchor list
-│   ├── ExtensionLoader.h/.cpp   # JSON → float[502*3] for C++ side
-│   ├── face_app_patch.cpp       # commented reference of the patched function
-│   └── README.md                # C++ integration guide
+│   ├── ExtensionConstants.h     # C++ 侧尺寸、锚点、502 项 indexMap
+│   ├── ExtensionLoader.h/.cpp   # 读取 Python 输出 JSON，转成 float[502*3]
+│   ├── face_app_patch.cpp       # update_face_vertex_buffer 的参考改法
+│   └── README.md                # C++ 接入清单
 └── data/
-    └── (generated JSONs and debug PNGs land here)
+    └── 运行后生成的 JSON 和调试 PNG 建议放这里
 ```
 
-## Quickstart
+## 环境准备
 
-### 1. Install deps
+建议先创建虚拟环境：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Windows PowerShell 可以用：
 
 ```powershell
 py -3 -m pip install -r requirements.txt
 ```
 
-`mediapipe`, `torch`, `torchvision`, and `transformers` are large; first run
-also downloads ~150 MB of `jonathandinu/face-parsing` weights into the HF
-cache.
+依赖里比较大的包有 `mediapipe`、`torch`、`torchvision`、`transformers`。第一次运行人脸分割时，还会自动下载约 150 MB 的 `jonathandinu/face-parsing` 权重到 HuggingFace 缓存。
 
-### 1a. Download the MediaPipe model
+还需要下载 MediaPipe FaceLandmarker 模型：
+
+```bash
+mkdir -p models
+curl -L -o models/face_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+```
+
+Windows PowerShell：
 
 ```powershell
 mkdir models
@@ -60,66 +83,381 @@ curl -L -o models/face_landmarker.task `
   https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
 ```
 
-### 2. (Re)generate `face_ext.obj`
+`python/face_landmarks.py` 默认会从 `models/face_landmarker.task` 加载这个文件。
 
-Already in the repo. If you edit `python/constants.py` (e.g. `MP_TOP_ANCHORS`
-or the UV strip), rebuild:
+## 快速运行
 
-```powershell
-py -3 python/build_extended_obj.py
+生成一张图片对应的 502 点 JSON：
+
+```bash
+python python/extract_hairline.py path/to/photo.jpg --out data/photo.json
 ```
 
-### 3. Run the full pipeline on an image
+如果有 CUDA，也可以指定设备给人脸分割模型：
 
-```powershell
-py -3 python/extract_hairline.py path/to/photo.jpg --out data/photo.json
+```bash
+python python/extract_hairline.py path/to/photo.jpg --out data/photo.json --device cuda
 ```
 
-Output `data/photo.json` schema:
+输出 JSON 结构如下：
 
 ```json
 {
-  "image":   {"width": 1024, "height": 1024, "path": "..."},
+  "image": {
+    "width": 1024,
+    "height": 1024,
+    "path": "path/to/photo.jpg"
+  },
   "n_total": 502,
-  "n_mp":    468,
+  "n_mp": 468,
   "n_extension": 34,
-  "layout":  ["mp[0..468)", "middle[468..485)", "hairline[485..502)"],
-  "points":  [[x_norm, y_norm, z_rel], ... 502 entries ...],
-  "valid_hairline": [true, true, ..., false, ...]   // 17 entries
+  "layout": [
+    "mp[0..468)",
+    "middle[468..485)",
+    "hairline[485..502)"
+  ],
+  "points": [
+    [0.501, 0.312, -0.041]
+  ],
+  "valid_hairline": [
+    true
+  ]
 }
 ```
 
-### 4. Visualize what the pipeline saw
+实际 `points` 有 502 项，顺序固定：
 
-```powershell
-py -3 python/visualize.py all path/to/photo.jpg --out data/photo_all.png
+| 下标范围 | 含义 | 数量 | 来源 |
+|----------|------|------|------|
+| `0..467` | MediaPipe 原始人脸点 | 468 | `FaceLandmarker.detect()` |
+| `468..484` | 额头中间行 | 17 | `build_middle_row()` |
+| `485..501` | 发际线行 | 17 | `sample_hairline()` + `lift_hairline_to_3d()` |
+
+`valid_hairline` 有 17 项。某一项为 `true` 表示对应锚点的射线真的命中了 hair/hat 像素；为 `false` 表示没有命中，使用了几何外推回退点。
+
+## 发际线是怎样识别出来的
+
+核心代码在 `python/hairline_2d.py`，入口是：
+
+```python
+hairline_2d, valid = sample_hairline(landmarks, parse_map)
+hairline_2d = smooth_hairline(hairline_2d, valid)
 ```
 
-Produces a 3-panel image: parsing overlay | anchor↔hairline rays | extended mesh wireframe.
+这里的识别不是靠传统边缘检测，也不是在整张图上找一条连续曲线；当前实现更稳定、更可控：先用语义分割知道哪里是头发，再从 17 个固定额头锚点向上找头发。
 
-Individual panels:
+### 1. 先得到 MediaPipe 468 点
 
-```powershell
-py -3 python/visualize.py parse   photo.jpg --out data/parse.png
-py -3 python/visualize.py anchors photo.jpg --out data/anchors.png
-py -3 python/visualize.py mesh    photo.jpg --out data/mesh.png
+`python/face_landmarks.py` 使用 MediaPipe Tasks Vision 的 `FaceLandmarker`：
+
+- 输入 RGB 图片。
+- `num_faces=1`，只取第一张脸。
+- MediaPipe task 模型可能输出 478 点，其中后 10 个是虹膜点；本项目只保留前 468 点，匹配原始 SDK 的 `face.obj`。
+- 每个点是 `[x, y, z]`：
+  - `x`、`y` 是归一化图像坐标，范围大致在 `[0, 1]`。
+  - `z` 是 MediaPipe 的相对深度，不是毫米，也不是相机真实深度。
+
+### 2. 固定 17 个 MediaPipe 上沿锚点
+
+`python/constants.py` 里定义了 17 个额头上沿锚点：
+
+```python
+MP_TOP_ANCHORS = [
+    127, 234, 162, 21, 54, 103, 67, 109, 10,
+    338, 297, 332, 284, 251, 389, 356, 454,
+]
 ```
 
-For the final mesh overlay (cyan MP boundary, orange middle row, yellow hairline):
+这些是 MediaPipe 原始 468 点的 landmark 下标，按正脸视角从左到右排列。每个锚点都会向上采样一个发际线点，所以最终得到 17 个发际线点。
 
-```powershell
-py -3 python/show_result.py photo.jpg data/photo.json --out data/photo_result.png
+这样做有两个好处：
+
+- 发际线点数量固定，和扩展 mesh 的拓扑、UV、SDK buffer 一一对应。
+- 每个发际线点都绑定到一个额头锚点，后续 2D -> 3D 时可以直接继承附近锚点的深度。
+
+### 3. 再做人脸语义分割
+
+`python/face_parsing.py` 使用 HuggingFace 模型：
+
+```text
+jonathandinu/face-parsing
 ```
 
-A pure-MediaPipe anchor preview that doesn't need torch:
+它会输出一张和原图同尺寸的 `parse_map`，每个像素是一个类别编号。类别定义在 `python/constants.py`，其中和发际线最相关的是：
 
-```powershell
-py -3 python/preview_anchors.py photo.jpg --out data/anchors_preview.png
+| 类别常量 | 编号 | 含义 |
+|----------|------|------|
+| `PARSE_SKIN` | 1 | 皮肤 |
+| `PARSE_HAIR` | 13 | 头发 |
+| `PARSE_HAT` | 14 | 帽子 |
+
+当前实现把 `hair` 和 `hat` 都算作可命中的“头发区域”：
+
+```python
+hair_mask = np.isin(parse_map, [PARSE_HAIR, PARSE_HAT])
 ```
 
-### 5. Feed the JSON to the C++ SDK
+也就是说，射线只要遇到被分割模型判为头发或帽子的像素，就认为到达了视觉上的头部上边界。对 AR 贴图来说，这通常比“解剖学发际线”更实用，因为刘海、帽檐、头发表面才是用户实际看到的边界。
 
-See [sdk/README.md](sdk/README.md). One-line summary:
+### 4. 计算“脸部向上”方向
+
+图片里的人脸可能略微歪头，所以不能简单使用屏幕坐标的 `(0, -1)`。`face_up_vector()` 用两个 MediaPipe 点估计脸的局部向上方向：
+
+- 下巴点：`152`
+- 额头顶部附近点：`10`
+
+计算方式：
+
+```python
+up = normalize(landmarks[10, :2] - landmarks[152, :2])
+```
+
+因为图像坐标里 `y` 向下增大，所以正脸时这个向量大致指向屏幕上方。后面每个锚点都会沿这个方向发出射线。
+
+### 5. 从每个锚点向上射线搜索第一个头发像素
+
+对每个 `MP_TOP_ANCHORS[i]`：
+
+1. 取这个 MediaPipe 点的归一化 2D 坐标。
+2. 乘以图片宽高，转成像素坐标。
+3. 沿 `up` 方向每次前进 1 像素。
+4. 检查当前位置是否落在 `hair_mask` 上。
+5. 第一次命中 hair/hat 像素，就返回这个位置作为该锚点对应的 2D 发际线点。
+
+伪代码：
+
+```python
+for mp_idx in MP_TOP_ANCHORS:
+    pos = landmarks[mp_idx, :2] * [W, H]
+    while pos still inside image:
+        pos += up_px * 1.0
+        if hair_mask[round(pos.y), round(pos.x)]:
+            hit = pos
+            break
+```
+
+这个设计有一个重要细节：射线不会因为进入背景就停止，只会在命中 hair/hat 时停止。这样做是为了处理太阳穴、耳侧这些横向锚点，因为这些点往上走时可能先离开脸部皮肤区域，再碰到头发。如果遇到背景就停止，侧边锚点很容易误判为脸/背景边界，而不是发际线。
+
+### 6. 如果找不到头发像素，就几何外推
+
+如果射线走出图片或走完最大步数仍未命中 hair/hat，`sample_hairline()` 会用固定距离回退：
+
+```python
+hairline = anchor + up * fallback_extrapolation
+```
+
+默认：
+
+```python
+fallback_extrapolation = 0.18
+```
+
+这里的 `0.18` 是归一化图像坐标里的距离。回退常见于：
+
+- 秃头或发际线很高，分割不到头发。
+- 头顶超出图片边界。
+- 分割模型漏判头发。
+- 帽子、强阴影、背景颜色造成分割异常。
+
+对应位置的 `valid_hairline[i]` 会写成 `false`，方便调试和 SDK 侧做额外处理。
+
+### 7. 对发际线采样点做轻量平滑
+
+语义分割边缘会有锯齿和局部抖动，所以命中 17 个点后会调用：
+
+```python
+smooth_hairline(hairline_2d, valid, iterations=2)
+```
+
+它对曲线中间点做两轮 `1-2-1` binomial 平滑：
+
+```python
+new[i] = 0.25 * p[i - 1] + 0.5 * p[i] + 0.25 * p[i + 1]
+```
+
+只有当前点 `valid[i] == true` 时才会更新该点；无效点会保留回退结果。两端点不参与平滑，避免边界收缩。
+
+### 8. 把 2D 发际线点提升到 3D
+
+`python/lift_3d.py` 的 `lift_hairline_to_3d()` 会把每个 2D 发际线点变成 3D 点：
+
+```python
+x = hairline_2d[i].x
+y = hairline_2d[i].y
+z = landmarks[MP_TOP_ANCHORS[i]].z + curve_offset_z(i)
+```
+
+也就是说：
+
+- `x`、`y` 来自实际识别到的发际线位置。
+- `z` 继承对应 MediaPipe 额头锚点的深度。
+- 再加一个预设的额头弧度偏移 `curve_offset_z(i)`。
+
+`curve_offset_z(i)` 是对称余弦形状：中间最深，两侧逐渐变浅。当前最大幅度约为 `-0.04`，目的是让头顶/额头上方看起来略微向后弯，而不是一整条平板。
+
+### 9. 生成中间行
+
+如果直接把 MediaPipe 上沿连到发际线行，三角面会又长又扁，贴图和光照都不自然。所以项目在中间加一行 17 个点：
+
+```python
+middle = 0.5 * anchor + 0.5 * hairline
+middle.z += bulge_z(i)
+```
+
+`bulge_z(i)` 也是对称余弦形状，当前最大幅度约为 `-0.015`，用来给额头区域一点弧度。最终新增的 34 个点就是：
+
+- `middle[0..16]`
+- `hairline[0..16]`
+
+### 10. 拼成 SDK 需要的 502 点
+
+最后 `assemble_full()` 按固定顺序拼接：
+
+```python
+points_full = concatenate([
+    landmarks_468,
+    middle_3d,
+    hairline_3d,
+])
+```
+
+这个顺序必须和 `face_ext.obj`、`sdk/ExtensionConstants.h`、`kIndexMap502` 保持一致。否则 C++ 侧会把点写到错误的 OBJ 顶点上。
+
+## Web 服务
+
+如果想用浏览器上传图片并查看结果，可以启动本地 Web 服务：
+
+```bash
+python python/web_service.py
+```
+
+默认地址：
+
+```text
+http://127.0.0.1:8000
+```
+
+打开页面后选择一张 `jpg`、`png` 或 `webp` 图片，点击“开始分析”。服务会输出三张图：
+
+| 图片 | 内容 |
+|------|------|
+| 原图 | 上传的原始图片 |
+| 发际线点 | 只画 17 个发际线采样点，绿色是真实命中 hair/hat，红色是几何外推回退点 |
+| 发际线 | 把 17 个采样点连成曲线，青色线段连接有效点，红色线段包含回退点 |
+
+如果想让局域网其他机器访问：
+
+```bash
+python python/web_service.py --host 0.0.0.0 --port 8000
+```
+
+如果要指定人脸分割模型运行设备：
+
+```bash
+python python/web_service.py --device cuda
+python python/web_service.py --device cpu
+```
+
+生成的上传图片和结果图会保存在 `data/web/`。第一次点击分析会加载 MediaPipe 和 SegFormer 模型，所以会比较慢；后续请求会复用已加载的模型。
+
+## 可视化和调试
+
+最推荐先运行总览图：
+
+```bash
+python python/visualize.py all path/to/photo.jpg --out data/photo_all.png
+```
+
+输出是一张三联图：
+
+| 面板 | 内容 | 用来检查什么 |
+|------|------|--------------|
+| parsing overlay | 人脸分割结果叠到原图上 | 头发是否被分成 hair/hat，皮肤是否误分 |
+| anchor rays | 17 个 MediaPipe 锚点、17 个发际线点和连线 | 射线是否从正确位置出发，是否命中真实发际线 |
+| mesh wireframe | 扩展区域三角网格投影 | 中间行和发际线行是否形成合理额头扩展带 |
+
+也可以分别输出：
+
+```bash
+python python/visualize.py parse   path/to/photo.jpg --out data/parse.png
+python python/visualize.py anchors path/to/photo.jpg --out data/anchors.png
+python python/visualize.py mesh    path/to/photo.jpg --out data/mesh.png
+```
+
+如果只想看 MediaPipe 17 个锚点，不想加载 torch/分割模型，可以运行：
+
+```bash
+python python/preview_anchors.py path/to/photo.jpg --out data/anchors_preview.png
+```
+
+如果已经有 `data/photo.json`，可以把最终扩展结果画回原图：
+
+```bash
+python python/show_result.py path/to/photo.jpg data/photo.json --out data/photo_result.png
+```
+
+## 生成和更新 `face_ext.obj`
+
+仓库里已经包含生成好的 `face_ext.obj`。只有改了这些内容时才需要重新生成：
+
+- `python/constants.py` 里的 `MP_TOP_ANCHORS`
+- 扩展顶点的 UV 常量
+- Z 弧度参数
+- `face.obj`
+- SDK 的原始 `indexMap`
+
+重新生成：
+
+```bash
+python python/build_extended_obj.py
+```
+
+生成逻辑：
+
+1. 读取原始 `face.obj`。
+2. 用 `_index_map_data.py` 里的 `INDEX_MAP_468` 建立 MediaPipe landmark 下标到 OBJ 顶点下标的反查表。
+3. 按 17 个 `MP_TOP_ANCHORS` 追加 17 个中间行顶点和 17 个发际线顶点。
+4. 给新增顶点分配固定 UV。
+5. 新增 64 个三角面，把 `anchor row -> middle row -> hairline row` 连成两条三角带。
+6. 写出 `face_ext.obj`。
+
+生成后的差异：
+
+```text
+vertices:  468 -> 502   (+34)
+texcoords: 468 -> 502   (+34)
+normals:   468 -> 502   (+34)
+triangles: 852 -> 916   (+64)
+```
+
+原始 468 个点、UV、法线和三角面保留在前面；新增内容只追加在文件末尾。运行时 SDK 会更新 502 个顶点的位置，法线由 SDK 重新计算。
+
+## UV 和贴图
+
+新增 34 个顶点有自己的静态 UV，定义在 `python/constants.py`：
+
+```python
+UV_STRIP_U_MIN = 0.05
+UV_STRIP_U_MAX = 0.95
+UV_MIDDLE_V = 0.02
+UV_HAIRLINE_V = 0.005
+```
+
+含义：
+
+- `U` 从左到右铺满一条细长区域，对应 17 列锚点。
+- `V` 有两行：一行给中间行，一行给发际线行。
+- OBJ 里写的是 raw V，SDK 加载 OBJ 时会做 `1 - v` 翻转，所以这里的低 V 对应贴图图片的上方区域。
+
+如果你的纹理图集里这块区域已经被占用，需要调整这些常量，然后重新运行：
+
+```bash
+python python/build_extended_obj.py
+```
+
+## C++ SDK 接入
+
+Python 侧生成 JSON 后，C++ 侧读取并直接传 502 点：
 
 ```cpp
 head3d::ExtensionPoints ext;
@@ -127,46 +465,63 @@ ext.LoadFromJson("data/photo.json");
 faceApp->update_face_vertex_buffer(ext.positions.data(), 502);
 ```
 
-## Tuning knobs
+接入清单：
 
-All in `python/constants.py`:
+1. 把 `sdk/ExtensionConstants.h`、`sdk/ExtensionLoader.h`、`sdk/ExtensionLoader.cpp` 放进 SDK 工程。
+2. 用 `head3d::kIndexMap502` 替换原来的 `indexMap[468]`，或按它的内容把原数组扩展到 502 项。
+3. 把 OBJ 加载路径改成 `face_ext.obj`。
+4. 参考 `sdk/face_app_patch.cpp` 修改 `FaceApp::update_face_vertex_buffer`，让循环覆盖 502 个顶点。
+5. 调用侧从 468 点输入改成 `ExtensionPoints::LoadFromJson()` 读出来的 502 点输入。
 
-| Constant | Purpose | When to tune |
-|----------|---------|--------------|
-| `MP_TOP_ANCHORS` | The 17 MediaPipe indices that define the upper boundary | If the rays in `visualize.py anchors` skip past actual hairline or come from a wrong spot |
-| `curve_offset_z(i)` | Forehead backward curvature (deepest at center) | If the mesh looks too flat or too curved in side view |
-| `bulge_z(i)` | Middle row inward bulge | Same |
-| `UV_STRIP_U_MIN/MAX`, `UV_MIDDLE_V`, `UV_HAIRLINE_V` | Where the extension UVs live in the atlas | If your texture content collides with the strip |
+缓冲增长很小：
 
-After tuning, rerun `python/build_extended_obj.py` and reload `face_ext.obj`
-in the SDK.
+| 内容 | 原来 | 现在 |
+|------|------|------|
+| 顶点 | 468 | 502，增加约 7% |
+| 索引 | `852 * 3 = 2556` | `916 * 3 = 2748`，增加约 7.5% |
 
-## Status by phase
+shader 和贴图采样逻辑不需要改；新增顶点已经在 OBJ 里有 UV。
 
-| Phase | Scope | Status |
-|-------|-------|--------|
-| **1** | Single image, frontal face | ✅ Python pipeline done; SDK files ready to drop in |
-| **2** | Real-time (video / camera) | Not started — see `PLAN_hairline.md` §5 |
-| **3** | Side-view faces | Not started — see `PLAN_hairline.md` §6 |
+## 可调参数
 
-## What changed vs. original (`face.obj` → `face_ext.obj`)
+主要都在 `python/constants.py`：
 
-```
-vertices:  468 → 502   (+34)
-texcoords: 468 → 502   (+34)
-normals:   468 → 502   (+34)
-triangles: 852 → 916   (+64)
-```
+| 参数 | 作用 | 什么时候调 |
+|------|------|------------|
+| `MP_TOP_ANCHORS` | 17 个 MediaPipe 额头上沿锚点 | 射线起点不合理、漏掉太阳穴、整体发际线偏移 |
+| `curve_offset_z(i)` | 发际线行的 Z 弧度 | 侧视时发际线太平、太凸或太陷 |
+| `bulge_z(i)` | 中间行的 Z 弧度 | 额头扩展带看起来像平面或折角明显 |
+| `UV_STRIP_U_MIN/MAX` | 新增区域在贴图里的横向范围 | 贴图内容横向拉伸、压缩或碰到其他图块 |
+| `UV_MIDDLE_V` | 中间行贴图 V 坐标 | 中间行采样到错误贴图位置 |
+| `UV_HAIRLINE_V` | 发际线行贴图 V 坐标 | 发际线边缘采样到错误贴图位置 |
+| `fallback_extrapolation` | 射线找不到头发时的外推距离 | 秃头、头顶出框、分割失败时回退点太高或太低 |
 
-The first 468 of everything is byte-identical to the original (modulo the
-file's whitespace formatting). Existing UV bakes still work as-is.
+改了 mesh 相关常量后，需要重新生成 `face_ext.obj` 并同步 SDK 常量。
 
-## Known limitations
+## 当前阶段
 
-- **Bald / hat / hairline outside frame**: hairline points fall back to a fixed
-  geometric extrapolation (`hairline_2d.py:sample_hairline:fallback_extrapolation`).
-- **Heavy bangs**: detected "hairline" is the bottom of the bangs, which is
-  the visually correct boundary for AR effects but not the anatomical hairline.
-- **Side view**: only weakly handled in Phase 1. The occluded side will produce
-  hairline samples drawn from the (possibly unreliable) opposite side of the
-  parser output. Phase 3 plans to mask these out.
+| 阶段 | 范围 | 状态 |
+|------|------|------|
+| Phase 1 | 单张图片、偏正脸 | Python 管线已完成，SDK 接入文件已准备 |
+| Phase 2 | 视频/相机实时 | 未开始，计划把分割和发际线逻辑移到实时 C++/移动端管线 |
+| Phase 3 | 大侧脸、遮挡侧处理 | 未开始，计划根据 yaw 判断遮挡侧并做透明或镜像回退 |
+
+## 已知限制
+
+- 秃头、发际线极高或头顶超出画面时，射线可能找不到 hair/hat 像素，会退回固定几何外推。
+- 厚刘海会被当成“视觉发际线”。这对贴图特效通常是正确的，因为用户看到的是刘海下沿，不是真实头发生长边界。
+- 帽子被纳入 `hair_mask`，所以帽檐可能被当成边界。如果想严格识别真实头发，需要把 `PARSE_HAT` 从 `build_hair_mask()` 里移除。
+- 当前只取第一张脸，`FaceLandmarkerOptions(num_faces=1)`。
+- 大侧脸还没有完整处理，遮挡侧的发际线可能来自不可靠的分割结果。
+- Z 值不是真实相机深度，只是 MediaPipe 相对深度加人工弧度偏移；它的目标是让渲染效果自然，不是医学或测量级 3D 重建。
+
+## 排查建议
+
+如果发际线位置不对，按这个顺序看：
+
+1. 先看 `visualize.py parse`：头发有没有被分割成 hair/hat。
+2. 再看 `visualize.py anchors`：17 个 MediaPipe 锚点是否在额头上沿，射线方向是否正确。
+3. 如果锚点错，调 `MP_TOP_ANCHORS`。
+4. 如果分割错，换图、改善光照，或换/微调 face parsing 模型。
+5. 如果 2D 点对但 3D 形状不好，调 `curve_offset_z(i)` 和 `bulge_z(i)`。
+6. 如果 mesh 对但贴图错，调 UV 常量并重新生成 `face_ext.obj`。

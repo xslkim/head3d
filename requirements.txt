@@ -5,6 +5,7 @@ numpy>=1.24
 opencv-python>=4.8
 mediapipe>=0.10
 Pillow>=10.0
+Flask>=3.0
 
 # Face parsing (HuggingFace SegFormer). Will auto-download ~150MB weights on first run.
 torch>=2.0
