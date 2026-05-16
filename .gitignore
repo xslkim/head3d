@@ -9,5 +9,11 @@ data/*.png
 data/*.jpg
 !data/.gitkeep
 
+# Web service runtime outputs (uploaded images + rendered result PNGs)
+data/web/
+
+# User reference / scratch images (not source code)
+data/refs/
+
 # Generated artifacts (track face_ext.obj since it's deterministic)
 # face_ext.obj is kept in repo

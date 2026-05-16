@@ -337,13 +337,19 @@ python python/web_service.py
 http://127.0.0.1:8000
 ```
 
-打开页面后选择一张 `jpg`、`png` 或 `webp` 图片，点击“开始分析”。服务会输出三张图：
+打开页面后选择一张 `jpg`、`png` 或 `webp` 图片，点击“开始分析”。服务会**并行运行多种发际线检测策略**（`python/hairline_2d.py` 中的所有 `sample_hairline_*` 函数），每个策略输出两张图（点和曲线）方便横向对比。
+
+> **推荐用 `arch` 冠状弧策略 (列表第一个)**：从一只耳朵上方画到另一只耳朵上方覆盖整个头顶。它先用中间 11 个真正落在额头上的锚点 + 密度门限射线找到额头-头发边界，再把左右两端钉在头部 silhouette 上沿，按 x 等距插值出 17 个点，最终再用 silhouette 钳位防止越过头顶。
+>
+> 其他 `arch_strict`、`arch_adj` 是同一思路的不同参数；`baseline` 等是历史方案（侧鬓位置不准）；`top_arc`、`silhouette_at_anchor_x` 等不依赖锚点；`density_*` 系列要求射线连续命中若干 hair 像素才停。
+
+每张结果图说明：
 
 | 图片 | 内容 |
 |------|------|
 | 原图 | 上传的原始图片 |
-| 发际线点 | 只画 17 个发际线采样点，绿色是真实命中 hair/hat，红色是几何外推回退点 |
-| 发际线 | 把 17 个采样点连成曲线，青色线段连接有效点，红色线段包含回退点 |
+| 发际线点 | 17 个发际线采样点，绿色是真实命中、红色是几何外推回退（`arch` 系列没有红色，是用 silhouette 替代回退） |
+| 发际线 | 把 17 个采样点连成曲线，青色线段连接有效点 |
 
 如果想让局域网其他机器访问：
 
@@ -358,7 +364,26 @@ python python/web_service.py --device cuda
 python python/web_service.py --device cpu
 ```
 
-生成的上传图片和结果图会保存在 `data/web/`。第一次点击分析会加载 MediaPipe 和 SegFormer 模型，所以会比较慢；后续请求会复用已加载的模型。
+Web 服务默认使用 `--landmark-backend subprocess`：每次分析都会启动一个独立子进程跑 MediaPipe FaceLandmarker，再把 468 个 landmark 通过临时 `.npy` 文件传回主进程。这样做的原因：
+
+- 仍然走完整的 MediaPipe + face parsing 管线，发际线检测和后续 3D mesh 生成的 landmark 来源完全一致；
+- 子进程在 import mediapipe 之前会注入 `LIBGL_ALWAYS_SOFTWARE=1`、`MESA_LOADER_DRIVER_OVERRIDE=llvmpipe`、`MEDIAPIPE_DISABLE_GPU=1`、`EGL_PLATFORM=surfaceless` 等环境变量，绕开 WSL 下 D3D12 EGL 初始化导致 `mediapipe.tasks` 段错误的问题；
+- 即使 native 代码仍然崩溃，只会杀掉子进程，Web 服务保持运行，并把崩溃信号反馈到页面上。
+
+如果你的环境已经稳定，可以选用进程内 backend：
+
+```bash
+python python/web_service.py --landmark-backend tasks      # 进程内 mediapipe.tasks
+python python/web_service.py --landmark-backend solutions  # 进程内 mediapipe.solutions（仅旧版 mediapipe 有）
+```
+
+如果连子进程也崩，且暂时不需要 MediaPipe landmark，也可以退回纯分割估计：
+
+```bash
+python python/web_service.py --landmark-backend parsing
+```
+
+生成的上传图片和结果图会保存在 `data/web/`。第一次点击分析时主进程会加载 SegFormer 分割模型，子进程会加载 MediaPipe 模型；之后请求里 SegFormer 复用已加载的模型，MediaPipe 子进程每次都会重新加载（换来的是稳定性）。服务默认关闭 Flask 多线程请求处理；如果确认环境稳定，可以加 `--threaded` 开启多线程请求。
 
 ## 可视化和调试
 
