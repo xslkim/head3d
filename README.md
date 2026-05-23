@@ -510,15 +510,17 @@ triangles: 852 -> 916   (+64)
 新增 34 个顶点的 UV 由 `python/constants.py` 的 `extension_uv_for(row, anchor_u)` 给出：
 
 ```python
-UV_MIDDLE_V    = 0.820   # raw OBJ V  → image y ≈  92  (品红弧线 / 中间行)
-UV_HAIRLINE_V  = 0.940   # raw OBJ V  → image y ≈  31  (蓝弧线 / 发际线行)
-# U: 直接继承对应 MP_TOP_ANCHORS[i] 的 U
+UV_MIDDLE_DV   = 0.110   # middle 行 V_raw 相对该列 anchor V_raw 上移这么多
+UV_HAIRLINE_DV = 0.220   # hairline 行 V_raw 相对该列 anchor V_raw 上移这么多
+# U: 直接继承 anchor.U
+# V: anchor.V + UV_MIDDLE_DV / UV_HAIRLINE_DV (跟随 anchor 弧度平行偏移)
 ```
 
 含义：
 
-- **U**: middle[i] 和 hairline[i] **直接复制** MP_TOP_ANCHORS[i] 这个 anchor 的 U。 anchor 17 个 U 是非均匀的 (`0.001..0.999`, 太阳穴附近 ≈ 0, 额头中央 ≈ 0.5)，ribbon 三角形列只有让 middle/hairline 跟着 anchor 的 U 才会**在 UV 空间里垂直**, 贴图 5 条横向弧线才不会被 ribbon 三角形扭成 Z 字形。 ❌ 如果用 0.05..0.95 均匀分布 U, 弧线会被斜拉。
-- **V**: anchor 行 V_raw ∈ [0.40, 0.77], middle 行 V_raw=0.82 (品红弧线), hairline 行 V_raw=0.94 (蓝弧线) — 全 17 列 anchor.V < middle.V < hairline.V 严格单调递增 (这是硬约束, anchor 最大 V 是额头中央 MP 10 的 0.7724, 所以 UV_MIDDLE_V 必须 > 0.7724 否则 ribbon 三角形 V 反向, 会出现局部贴图翻转折叠)。 品红和蓝两条弧线分别原位采到 middle / hairline 行, 其余 3 条弧线 (橙/红/紫) 通过 V 方向插值自动展开在 anchor → middle → hairline 的过渡带上。
+- **U**: middle[i] 和 hairline[i] **直接复制** MP_TOP_ANCHORS[i] 这个 anchor 的 U。 anchor 17 个 U 是非均匀的 (`0.001..0.999`, 太阳穴附近 ≈ 0, 额头中央 ≈ 0.5)，ribbon 三角形列只有让 middle/hairline 跟着 anchor 的 U 才会**在 UV 空间里垂直**, 贴图横向弧线才不会被 ribbon 三角形扭成 Z 字形。 ❌ 如果用 0.05..0.95 均匀分布 U, 弧线会被斜拉。
+- **V — anchor 平行偏移而不是固定常数**: anchor 17 个 V 是**非均匀弧形** (额头中央 MP 10 = 0.7724, 太阳穴 MP 127 = 0.467). 如果 middle/hairline 用固定常数 V (例如 0.82 / 0.998), 每个 quad 的 V 跨度 = `middle.V − anchor[i].V` 在 17 列之间从 0.05 (中央) 跳到 0.35 (两端), 差了 7 倍 — 贴图 5 条弧线在 mesh 上**粗细不均**, 下面那条线在 V 跨度大的列被拉伸成粗大色块, 上面 4 条在 V 跨度小的列被压缩成细线。 改成 `middle.V = anchor[i].V + 0.110`, `hairline.V = anchor[i].V + 0.220` 之后, 每个 quad 的 V 跨度恒定 0.110 (17 列 std=0), ribbon 在贴图上是一条上下平行的弯月形带, 5 条弧线在 mesh 上粗细一致。
+- **硬约束**: `0 < UV_MIDDLE_DV < UV_HAIRLINE_DV ≤ 1 − anchor.V_max ≈ 0.228` (anchor 中央列加 Δh 后不能溢出 V=1, 否则会采到贴图边缘抗锯齿像素)。
 - OBJ 里写的是 raw V, Three.js 用默认 `texture.flipY=true` 时 V_raw=1 直接对应贴图图片顶部, 不需要再翻转。
 
 > ⚠️ 历史教训: 早期 `UV_MIDDLE_V=0.02 / UV_HAIRLINE_V=0.005` 把 ribbon UV 放到了贴图**底部**空白区 (img y ≈ 502..510), 结果 34 个新点采样全是白色, 发际线带完全看不见。 而贴图实际内容 (5 条彩色弧线) 一直在顶部 V_raw ≈ 0.67..0.94。 修复后, 在 `/preview` 顶部 ortho overlay 上能直接看到 5 条弧线投影在额头到发际线区域。

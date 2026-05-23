@@ -53,6 +53,7 @@ def build_inverse_index_map() -> dict[int, int]:
 def canonical_extension_positions(
     mesh: ObjMesh,
     inv_index_map: dict[int, int],
+    crown_lift_frac: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute default 3D positions for the 17 middle + 17 hairline vertices.
 
@@ -67,14 +68,24 @@ def canonical_extension_positions(
     This always pushes the new vertex BACKWARD (+Z in face.obj convention
     = back of head), so middle / hairline points sit on the head surface
     rather than floating in front of the face.
+
+    crown_lift_frac=None falls back to ``C.HAIRLINE_CROWN_LIFT_FRAC`` (the
+    build-time default baked into face_ext.obj). The web service overrides
+    it on a slider to redraw the canonical viewer live.
     """
+    if crown_lift_frac is None:
+        crown_lift_frac = C.HAIRLINE_CROWN_LIFT_FRAC
+
     pos = np.array(mesh.positions, dtype=np.float32)  # (468, 3)
     min_y = float(pos[:, 1].min())
     max_y = float(pos[:, 1].max())
     face_h = max_y - min_y
 
-    middle_lift  = 0.05 * face_h
-    hairline_lift = 0.12 * face_h
+    # hairline_lift = base 0.12 (detected hairline above MP top anchor)
+    #               + crown_lift_frac (additional crown push).
+    # middle_lift is half of that so the ribbon stays evenly subdivided.
+    hairline_lift = (0.12 + float(crown_lift_frac)) * face_h
+    middle_lift   = 0.5 * hairline_lift
     R = max(1e-6, C.HEAD_ARC_RADIUS_FRAC * face_h)
 
     middle   = np.zeros((C.N_ANCHORS, 3), dtype=np.float32)
@@ -98,18 +109,20 @@ def extension_uvs(
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Return UVs for middle row and hairline row, in OBJ raw V format.
 
-    Each new vertex copies the U of the corresponding MP anchor so the
-    ribbon triangle column is vertical in UV space; only V differs
-    between anchor / middle / hairline. See constants.extension_uv_for
-    for why.
+    Each new vertex copies both (U, V_raw) of the corresponding MP anchor
+    and only ADDS a constant Δv (UV_MIDDLE_DV / UV_HAIRLINE_DV) on top.
+    That way the ribbon column is vertical (anchor.U == middle.U == hairline.U)
+    AND the ribbon row stays parallel to the anchor row in UV space, so
+    each quad has the same V span across all 17 columns. See
+    constants.extension_uv_for for why.
     """
     middle_uv: list[tuple[float, float]] = []
     hairline_uv: list[tuple[float, float]] = []
     for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
         anchor_obj_idx = inv_index_map[mp_idx]
-        anchor_u = mesh.texcoords[anchor_obj_idx][0]
-        middle_uv.append(C.extension_uv_for(0, anchor_u))
-        hairline_uv.append(C.extension_uv_for(1, anchor_u))
+        anchor_u, anchor_v = mesh.texcoords[anchor_obj_idx]
+        middle_uv.append(C.extension_uv_for(0, anchor_u, anchor_v))
+        hairline_uv.append(C.extension_uv_for(1, anchor_u, anchor_v))
     return middle_uv, hairline_uv
 
 

@@ -24,6 +24,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import constants as C
+from .hairline_2d import face_up_vector
 
 
 def _face_height(landmarks_norm: np.ndarray) -> float:
@@ -41,22 +42,34 @@ def _arc_dz(dy: float, R: float) -> float:
 def lift_hairline_to_3d(
     landmarks_norm: np.ndarray,
     hairline_norm_xy: np.ndarray,
+    crown_lift_frac: float | None = None,
 ) -> np.ndarray:
-    """Combine 2D hairline points with a Z that follows the head's
-    sagittal curvature.
+    """Combine 2D hairline samples with a sagittal-arc Z, after lifting
+    the (x, y) along the face-up direction by ``crown_lift_frac × face_h``
+    so the ribbon's top row sits at the crown of the head rather than at
+    the detected hair-skin boundary.
 
     landmarks_norm:    (468, 3) MediaPipe normalized landmarks.
     hairline_norm_xy:  (N_ANCHORS, 2) 2D hairline samples in [0,1] image space.
-    Returns:           (N_ANCHORS, 3) — (x_norm, y_norm, z_relative).
+    crown_lift_frac:   how far above the detected hairline (in fractions of
+                       face height) the mesh row should sit. ``None`` uses
+                       ``C.HAIRLINE_CROWN_LIFT_FRAC``.
+    Returns:           (N_ANCHORS, 3) — (x_norm_lifted, y_norm_lifted, z).
     """
-    R = C.HEAD_ARC_RADIUS_FRAC * _face_height(landmarks_norm)
+    face_h = _face_height(landmarks_norm)
+    R = C.HEAD_ARC_RADIUS_FRAC * face_h
+    if crown_lift_frac is None:
+        crown_lift_frac = C.HAIRLINE_CROWN_LIFT_FRAC
+    up = face_up_vector(landmarks_norm)
+    lift = up * (crown_lift_frac * face_h)        # 2D offset, face-up direction
+
     out = np.zeros((C.N_ANCHORS, 3), dtype=np.float32)
     for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
         z_a = float(landmarks_norm[mp_idx, 2])
         y_a = float(landmarks_norm[mp_idx, 1])
-        x_h = float(hairline_norm_xy[i, 0])
-        y_h = float(hairline_norm_xy[i, 1])
-        dy = y_h - y_a
+        x_h = float(hairline_norm_xy[i, 0]) + float(lift[0])
+        y_h = float(hairline_norm_xy[i, 1]) + float(lift[1])
+        dy = y_h - y_a                              # < 0 (上移更多 → dz 更大)
         out[i, 0] = x_h
         out[i, 1] = y_h
         out[i, 2] = z_a + _arc_dz(dy, R)

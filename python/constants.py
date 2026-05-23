@@ -48,6 +48,19 @@ HAIRLINE_START = N_MP + N_ANCHORS # 485
 HEAD_ARC_RADIUS_FRAC = 0.30
 
 
+# Extra lift applied to the detected hairline along the face-up direction,
+# expressed as a fraction of the MP face height. The 2D hairline detector
+# stops at the hair-skin boundary (start of the visible hair); the mesh
+# ribbon's top row should sit at the crown of the head instead, so the
+# texture-overlay band can cover the whole forehead → crown region.
+#
+# 0.10 ≈ moves the hairline row up by 10% of face height (~half the
+# distance from the detected hairline to the visible crown on a typical
+# frontal photo). Bump it to 0.15..0.20 for taller forehead / higher
+# crown; drop to 0.05 to keep the ribbon close to the hair-skin boundary.
+HAIRLINE_CROWN_LIFT_FRAC = 0.10
+
+
 # UV layout for the 34 forehead-extension vertices.
 #
 # The texture (imgs/texture0.png, 512×512) is laid out with the original
@@ -74,24 +87,42 @@ HEAD_ARC_RADIUS_FRAC = 0.30
 # 0.05..0.95 U for the strip the columns would slant relative to the
 # anchor U values, warping the texture's 5 horizontal arcs into
 # zig-zags. So `extension_uv_for` takes `anchor_u` and copies it.
-UV_MIDDLE_V    = 0.820   # raw OBJ V → image y ≈  92 (magenta / middle arc)
-UV_HAIRLINE_V  = 0.940   # raw OBJ V → image y ≈  31 (blue / top arc)
-# face.obj 中 17 个 MP_TOP_ANCHORS 的 V_raw 最大值 ≈ 0.7724 (额头中央 MP 10).
-# UV_MIDDLE_V 必须 > 0.7724, 否则 anchor → middle 这一段 V 方向会反向, 三角形
-# 会被翻转, 贴图弧线在那 3 列出现锯齿/折叠。 当前 0.82 同时落在贴图品红弧线
-# (V_raw ≈ 0.824) 上, 蓝/紫/品红 3 条弧线都会原位采到, 红/橙 2 条弧线通过
-# anchor 行的 V 插值出现在 anchor 与 middle 之间的过渡带。
+UV_MIDDLE_DV   = 0.110   # middle 行 V_raw 相对该列 anchor V_raw 上移这么多
+UV_HAIRLINE_DV = 0.220   # hairline 行 V_raw 相对该列 anchor V_raw 上移这么多
+# 为什么是"相对 anchor 平行偏移"而不是固定常数:
+#
+# face.obj 中 17 个 MP_TOP_ANCHORS 的 V_raw 是**非均匀弧形** (额头中央 MP 10
+# = 0.7724, 太阳穴 MP 127 = 0.4668, 横跨 0.30 V 单位)。 如果 middle/hairline
+# 用固定常数 V_raw (例如 0.82 / 0.998), 那每个 ribbon quad 的 V 跨度
+# (= middle.V − anchor[i].V) 在 17 列之间差异巨大 (中央列 0.05, 两端列 0.35,
+# 差了 7 倍)。 贴图最底部的弧线 (V_raw ≈ 0.76) 正好落在 V 跨度大的列上 →
+# 被拉伸成粗大色块, 而顶部弧线 (V_raw ≈ 0.93) 落在 V 跨度小的列上 → 被压
+# 缩成细线。 这就是"最下面那条线特别粗、上面 4 根都细"的根因。
+#
+# 把 middle/hairline 的 V 也设成"anchor V + 固定 Δ", 每列的 V 跨度变成恒定
+# 的 Δm / (Δh − Δm), ribbon 在贴图上是上下都跟随 anchor 弧度的弯月形带,
+# 贴图 5 条弧线在 mesh 上粗细均匀。
+#
+# 硬约束:
+#   1. Δm > 0 且 Δm < Δh (顺序保持 anchor < middle < hairline, 防 V 反向)
+#   2. anchor.V_max + Δh ≤ 1.0  (即 Δh ≤ 1 − 0.7724 = 0.2276)
+#      否则中央列 hairline V 溢出, 采到贴图边缘的抗锯齿像素。
+# 当前 Δh = 0.220 留 ≈ 0.008 V 单位 buffer; Δm = Δh / 2 让上下两段等宽。
 
 
-def extension_uv_for(row: int, anchor_u: float) -> tuple[float, float]:
+def extension_uv_for(row: int, anchor_u: float, anchor_v: float) -> tuple[float, float]:
     """Return (u, v_raw) UV for an extension vertex.
 
     row:       0 = middle, 1 = hairline.
-    anchor_u:  U of the MP anchor this extension vertex sits above (copy
-               it verbatim so the ribbon triangle is vertical in UV space).
+    anchor_u:  U of the corresponding MP anchor (copy verbatim → ribbon column
+               is vertical in UV space).
+    anchor_v:  V_raw of the corresponding MP anchor (we add a constant Δ to
+               it → ribbon row stays parallel to anchor row in UV space, so
+               each quad has the same V span and texture arcs render at the
+               same thickness across all 17 columns).
     """
-    v = UV_MIDDLE_V if row == 0 else UV_HAIRLINE_V
-    return (anchor_u, v)
+    dv = UV_MIDDLE_DV if row == 0 else UV_HAIRLINE_DV
+    return (anchor_u, anchor_v + dv)
 
 
 # Face-parsing class indices for the jonathandinu/face-parsing

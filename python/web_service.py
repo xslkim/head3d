@@ -315,10 +315,14 @@ class HairlineWebAnalyzer:
             "elapsed_ms": elapsed,
         }
 
-    def prepare_preview(self, stem: str) -> dict:
-        """Run the v1 (502-vertex) pipeline with default params and return
-        the points in both MP-order (raw output) and OBJ-vertex order
-        (slot-for-slot match with face_ext.obj), plus metadata.
+    def prepare_preview(self, stem: str, crown_lift_frac: float | None = None) -> dict:
+        """Run the v1 (502-vertex) pipeline with the given crown-lift and
+        return the points in both MP-order (raw output) and OBJ-vertex
+        order (slot-for-slot match with face_ext.obj), plus metadata.
+
+        crown_lift_frac:  how far above the detected hairline (in fractions
+                          of face height) the mesh ribbon's top row should
+                          sit. ``None`` falls back to C.HAIRLINE_CROWN_LIFT_FRAC.
 
         The caller is expected to have already called `prepare(image_path, stem)`.
         """
@@ -346,7 +350,10 @@ class HairlineWebAnalyzer:
             hairline_smoothed = smooth_hairline_corner_aware(
                 hairline_17.copy(), valid_17, iterations=2,
             )
-            hairline_3d = lift_hairline_to_3d(landmarks, hairline_smoothed)
+            hairline_3d = lift_hairline_to_3d(
+                landmarks, hairline_smoothed,
+                crown_lift_frac=crown_lift_frac,
+            )
             middle_3d = build_middle_row(landmarks, hairline_3d)
 
             pts_mp = assemble_full(landmarks, middle_3d, hairline_3d)
@@ -360,6 +367,11 @@ class HairlineWebAnalyzer:
                 pts_obj[obj_idx] = pts_mp[mp_idx]
             pts_obj[C.N_MP:] = pts_mp[C.N_MP:]
 
+        effective_lift = (
+            float(crown_lift_frac)
+            if crown_lift_frac is not None
+            else float(C.HAIRLINE_CROWN_LIFT_FRAC)
+        )
         return {
             "image": {"width": int(w), "height": int(h)},
             "n_total": int(pts_mp.shape[0]),
@@ -371,6 +383,7 @@ class HairlineWebAnalyzer:
                 "v1_middle": [C.MIDDLE_START, C.HAIRLINE_START],
                 "v1_hairline": [C.HAIRLINE_START, C.N_TOTAL],
             },
+            "crown_lift_frac": effective_lift,
         }
 
 
@@ -846,6 +859,23 @@ PREVIEW_HTML = """
           <div class="item"><span class="swatch" style="background:#ffc864"></span> v1 hairline 17</div>
         </div>
         <div class="meta" id="meta">--</div>
+        <div style="margin-top:14px; padding:10px 12px; border:1px dashed #cbd5e1; border-radius:8px;">
+          <label for="crown_lift" style="display:flex; gap:8px; align-items:center; font-size:13px; font-weight:600; color:#1f2937;">
+            发际线行向头顶外推 (crown lift, % 脸高)
+            <span id="crown_lift_val" style="font-family:ui-monospace,monospace; color:#1d4ed8;">10</span>
+            <span id="crown_lift_status" class="status">--</span>
+          </label>
+          <input type="range" id="crown_lift" min="0" max="40" step="1" value="10" style="width:100%; margin-top:6px;">
+          <div style="display:flex; justify-content:space-between; font-size:11px; color:#6b7280; margin-top:2px;">
+            <span>0 = 贴发际线 (检测原位)</span>
+            <span>10 = 默认 (≈半段到头顶)</span>
+            <span>30+ = 到头顶</span>
+          </div>
+          <div style="font-size:11px; color:#6b7280; margin-top:6px; line-height:1.4;">
+            把 17 个 hairline 顶点沿 face-up 方向再多推 N% × face_h, 同时 middle 行自动取
+            anchor 与 hairline 的中点。 z 用矢状-arc 公式重新解, 越往头顶 z 越靠后, 仍贴在头骨曲面上。
+          </div>
+        </div>
       </article>
 
       <article class="card">
@@ -896,65 +926,125 @@ PREVIEW_HTML = """
       }
 
       // --- Fetch detected points -----------------------------------------
+      // currentData is updated whenever the slider triggers a refetch; the
+      // live-overlay mesh and left dot-overlay re-render from it.
+      let currentData = null;
+      const liveMeshRefs = { geom: null, bufferToObj: null };       // filled by setupLiveOverlay
+      const canonicalMeshRefs = { geom: null, bufferToObj: null };  // filled by setupCanonicalViewer
+
+      async function fetchData(crownLiftX100) {
+        const url = (crownLiftX100 === null || crownLiftX100 === undefined)
+          ? '/preview/api/data/' + STEM
+          : '/preview/api/data/' + STEM + '?crown_lift_x100=' + crownLiftX100;
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('GET /preview/api/data failed: ' + r.status);
+        return await r.json();
+      }
+
       let dataPromise = (async () => {
         setStatus('载入识别点 …', 'busy');
-        const r = await fetch('/preview/api/data/' + STEM);
-        if (!r.ok) throw new Error('GET /preview/api/data failed: ' + r.status);
-        const j = await r.json();
-        return j;
+        currentData = await fetchData(null);
+        return currentData;
       })();
 
       // --- Left: original image + 502 colored dots overlay ---------------
-      async function drawOverlay() {
-        const data = await dataPromise;
-        const img = document.getElementById('orig_img');
-        const canvas = document.getElementById('overlay_canvas');
-        const meta = document.getElementById('meta');
+      const origImg = document.getElementById('orig_img');
+      const overlayCanvas = document.getElementById('overlay_canvas');
+      const metaEl = document.getElementById('meta');
 
-        async function draw() {
-          const W = img.naturalWidth, H = img.naturalHeight;
-          canvas.width = W; canvas.height = H;
-          const ctx = canvas.getContext('2d');
-          ctx.clearRect(0, 0, W, H);
-          const groups = data.groups;
-          const colors = {
-            mp: '#cccccc', v1_middle: '#ffa040', v1_hairline: '#ffc864',
-          };
-          const radii = { mp: 1.6, v1_middle: 3.2, v1_hairline: 3.2 };
-          const pts = data.points_mp_order;
-          for (const [name, [a, b]] of Object.entries(groups)) {
-            const c = colors[name];
-            if (!c) continue;
-            ctx.fillStyle = c;
-            const r = (radii[name] || 2) * (Math.min(W, H) / 600.0);
-            for (let i = a; i < b; i++) {
-              const p = pts[i];
-              const x = p[0] * W, y = p[1] * H;
-              ctx.beginPath();
-              ctx.arc(x, y, r, 0, 2 * Math.PI);
-              ctx.fill();
-            }
-          }
-          // Z stats so we can verify added points have z >= their MP anchor
-          // (sagittal-arc model). hairline 中央 z 应 > MP 10 (额头) z.
-          const ANCHORS = [127,234,162,21,54,103,67,109,10,338,297,332,284,251,389,356,454];
-          const HAIR_START = 485;
-          let anchor_z_sum = 0, hair_z_sum = 0;
-          for (let i = 0; i < 17; i++) {
-            anchor_z_sum += pts[ANCHORS[i]][2];
-            hair_z_sum += pts[HAIR_START + i][2];
-          }
-          const dz_mean = (hair_z_sum - anchor_z_sum) / 17;
-          meta.innerHTML =
-            '图片 ' + W + 'x' + H + ' · 502 点 (468 MP + 17 mid + 17 hair)<br>' +
-            'valid_hairline ' + data.valid_hairline.filter(Boolean).length + '/17 · ' +
-            '⟨ z(hairline) − z(MP anchor) ⟩ = ' + dz_mean.toFixed(4) +
-            (dz_mean > 0 ? ' ✓ (向头后弯, 贴皮肤)' : ' ✗ (浮在脸前!)');
+      function redrawDotsAndMeta(data) {
+        if (!data) return;
+        if (!(origImg.complete && origImg.naturalWidth > 0)) {
+          origImg.addEventListener('load', () => redrawDotsAndMeta(data), { once: true });
+          return;
         }
-        if (img.complete && img.naturalWidth > 0) await draw();
-        else img.addEventListener('load', draw, { once: true });
+        const W = origImg.naturalWidth, H = origImg.naturalHeight;
+        overlayCanvas.width = W; overlayCanvas.height = H;
+        const ctx = overlayCanvas.getContext('2d');
+        ctx.clearRect(0, 0, W, H);
+        const colors = { mp: '#cccccc', v1_middle: '#ffa040', v1_hairline: '#ffc864' };
+        const radii  = { mp: 1.6,        v1_middle: 3.2,        v1_hairline: 3.2 };
+        const pts = data.points_mp_order;
+        for (const [name, [a, b]] of Object.entries(data.groups)) {
+          const c = colors[name];
+          if (!c) continue;
+          ctx.fillStyle = c;
+          const r = (radii[name] || 2) * (Math.min(W, H) / 600.0);
+          for (let i = a; i < b; i++) {
+            const p = pts[i];
+            ctx.beginPath();
+            ctx.arc(p[0] * W, p[1] * H, r, 0, 2 * Math.PI);
+            ctx.fill();
+          }
+        }
+        const ANCHORS = [127,234,162,21,54,103,67,109,10,338,297,332,284,251,389,356,454];
+        const HAIR_START = 485;
+        let anchor_z_sum = 0, hair_z_sum = 0;
+        for (let i = 0; i < 17; i++) {
+          anchor_z_sum += pts[ANCHORS[i]][2];
+          hair_z_sum   += pts[HAIR_START + i][2];
+        }
+        const dz_mean = (hair_z_sum - anchor_z_sum) / 17;
+        const lift_pct = (data.crown_lift_frac * 100).toFixed(1);
+        metaEl.innerHTML =
+          '图片 ' + W + 'x' + H + ' · 502 点 (468 MP + 17 mid + 17 hair)<br>' +
+          'valid_hairline ' + data.valid_hairline.filter(Boolean).length + '/17 · ' +
+          'crown_lift = ' + lift_pct + '% face_h · ' +
+          '⟨ z(hairline) − z(MP anchor) ⟩ = ' + dz_mean.toFixed(4) +
+          (dz_mean > 0 ? ' ✓' : ' ✗');
       }
-      drawOverlay().catch(e => setStatus('左侧渲染失败: ' + e, 'err'));
+
+      dataPromise.then(redrawDotsAndMeta).catch(e => setStatus('左侧渲染失败: ' + e, 'err'));
+
+      // --- Slider: re-fetch on crown_lift change -------------------------
+      const lift_input = document.getElementById('crown_lift');
+      const lift_val   = document.getElementById('crown_lift_val');
+      const lift_status = document.getElementById('crown_lift_status');
+      let liftSeq = 0, liftTimer = null;
+
+      async function fetchCanonicalPositions(crownLiftX100) {
+        const url = '/preview/assets/canonical_positions?crown_lift_x100=' + crownLiftX100;
+        const r = await fetch(url);
+        if (!r.ok) throw new Error('GET canonical_positions failed: ' + r.status);
+        return await r.json();
+      }
+
+      async function applyCrownLift(v) {
+        const seq = ++liftSeq;
+        lift_status.textContent = '渲染中…';
+        lift_status.className = 'status busy';
+        try {
+          // Fire both requests in parallel: detected mesh (per-image) and
+          // canonical mesh (per-lift). They share the slider value but
+          // come from independent server-side caches.
+          const [j, canon] = await Promise.all([
+            fetchData(v),
+            fetchCanonicalPositions(v),
+          ]);
+          if (seq !== liftSeq) return;
+          currentData = j;
+          redrawDotsAndMeta(j);
+          if (liveMeshRefs.geom && liveMeshRefs.bufferToObj) {
+            applyDetectedPositions(liveMeshRefs.geom, liveMeshRefs.bufferToObj, j.points_obj_order);
+          }
+          if (canonicalMeshRefs.geom && canonicalMeshRefs.bufferToObj) {
+            applyFlatPositions(canonicalMeshRefs.geom, canonicalMeshRefs.bufferToObj, canon.positions);
+          }
+          lift_status.textContent = '✓';
+          lift_status.className = 'status';
+        } catch (e) {
+          if (seq === liftSeq) {
+            lift_status.textContent = '错误: ' + e;
+            lift_status.className = 'status err';
+          }
+        }
+      }
+
+      lift_input.addEventListener('input', () => {
+        lift_val.textContent = lift_input.value;
+        if (liftTimer) clearTimeout(liftTimer);
+        liftTimer = setTimeout(() => { liftTimer = null; applyCrownLift(parseInt(lift_input.value, 10)); }, 180);
+      });
 
       // --- Right: TOP = ortho overlay on photo, BOTTOM = 3D canonical ----
       // Geometry source: we ship an indexed JSON instead of using OBJLoader
@@ -1020,6 +1110,19 @@ PREVIEW_HTML = """
           const p = points_obj_order[objIdx];
           if (!p) continue;
           pos.setXYZ(i, p[0], p[1], p[2]);
+        }
+        pos.needsUpdate = true;
+        geometry.computeVertexNormals();
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
+      }
+
+      function applyFlatPositions(geometry, bufferToObj, flatPositions) {
+        // flatPositions: length n_obj_vertices * 3, OBJ vertex order.
+        const pos = geometry.attributes.position;
+        for (let i = 0; i < pos.count; i++) {
+          const o = bufferToObj[i] * 3;
+          pos.setXYZ(i, flatPositions[o], flatPositions[o + 1], flatPositions[o + 2]);
         }
         pos.needsUpdate = true;
         geometry.computeVertexNormals();
@@ -1096,6 +1199,12 @@ PREVIEW_HTML = """
         tex.flipY = true;
         tex.needsUpdate = true;
 
+        // Save refs so the crown-lift slider can update canonical positions
+        // without rebuilding the geometry. Initial positions already match
+        // C.HAIRLINE_CROWN_LIFT_FRAC because face_ext.obj was built with it.
+        canonicalMeshRefs.geom = geom;
+        canonicalMeshRefs.bufferToObj = bufferToObj;
+
         const matTex = buildBaseMaterial(tex);
         const matWire = new THREE.MeshBasicMaterial({
           color: 0x55ff88, wireframe: true, transparent: true, opacity: 0.6,
@@ -1153,6 +1262,10 @@ PREVIEW_HTML = """
             ' != OBJ vertex count ' + nObjVertices + ', rendering overlap only.');
         }
         applyDetectedPositions(geom, bufferToObj, data.points_obj_order);
+        // Expose geom + mapping so the crown-lift slider can update positions
+        // without rebuilding the mesh.
+        liveMeshRefs.geom = geom;
+        liveMeshRefs.bufferToObj = bufferToObj;
 
         const matTex = new THREE.MeshBasicMaterial({
           map: tex, side: THREE.DoubleSide, color: 0xffffff,
@@ -1292,14 +1405,14 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
         return send_from_directory(WEB_DATA_DIR, filename)
 
     # ----- /preview: end-to-end 3D verification -----------------------------
-    # Caches per-stem the most recent /preview/api/data payload so the page
-    # reload + 3D viewer fetch don't double-cost the v2 pipeline.
-    preview_data_cache: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
+    # Caches per (stem, crown_lift) the most recent /preview/api/data payload
+    # so slider drags don't keep re-running the pipeline at known values.
+    preview_data_cache: "collections.OrderedDict[tuple[str, float | None], dict]" = collections.OrderedDict()
 
-    def _store_preview_data(stem: str, data: dict) -> None:
-        if stem in preview_data_cache:
-            preview_data_cache.move_to_end(stem)
-        preview_data_cache[stem] = data
+    def _store_preview_data(key: "tuple[str, float | None]", data: dict) -> None:
+        if key in preview_data_cache:
+            preview_data_cache.move_to_end(key)
+        preview_data_cache[key] = data
         while len(preview_data_cache) > CACHE_MAX_ENTRIES:
             preview_data_cache.popitem(last=False)
 
@@ -1331,7 +1444,7 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
         except Exception as exc:
             return render_template_string(PREVIEW_HTML, init=None, error=str(exc)), 500
         prepare_ms = int((time.perf_counter() - started) * 1000)
-        _store_preview_data(stem, data)
+        _store_preview_data((stem, None), data)
 
         init = AnalysisInit(
             original_name=safe_name,
@@ -1345,22 +1458,32 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
         )
         return render_template_string(PREVIEW_HTML, init=init, error=None)
 
+    def _parse_crown_lift(arg: str | None) -> float | None:
+        """Parse ?crown_lift_x100=NN query arg, value × 1/100 → fraction."""
+        if arg is None:
+            return None
+        try:
+            v = int(arg)
+        except (TypeError, ValueError):
+            return None
+        v = max(0, min(40, v))
+        return v / 100.0
+
     @app.get("/preview/api/data/<stem>")
     def preview_api_data(stem: str):
-        data = preview_data_cache.get(stem)
-        if data is not None:
-            preview_data_cache.move_to_end(stem)
-            return jsonify(data)
-        # Cache miss (e.g. process restart). Try to re-derive from the
-        # analyzer cache if the original (rgb, parse_map, landmarks) is
-        # still there.
+        lift = _parse_crown_lift(request.args.get("crown_lift_x100"))
+        cache_key = (stem, lift)
+        cached = preview_data_cache.get(cache_key)
+        if cached is not None:
+            preview_data_cache.move_to_end(cache_key)
+            return jsonify(cached)
         try:
-            data = analyzer.prepare_preview(stem)
+            data = analyzer.prepare_preview(stem, crown_lift_frac=lift)
         except KeyError as exc:
             return (str(exc), 410)
         except Exception as exc:
             return (str(exc), 500)
-        _store_preview_data(stem, data)
+        _store_preview_data(cache_key, data)
         return jsonify(data)
 
     @app.get("/preview/outputs/<path:filename>")
@@ -1425,6 +1548,56 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
             }
             preview_asset_obj_json._cache = cache  # type: ignore[attr-defined]
         return jsonify(cache)
+
+    @app.get("/preview/assets/canonical_positions")
+    def preview_asset_canonical_positions():
+        """Return the 502 canonical positions for face_ext.obj computed at
+        a given crown_lift fraction. Lets the right-bottom canonical viewer
+        follow the same slider as the runtime detected mesh, instead of being
+        frozen at the build-time HAIRLINE_CROWN_LIFT_FRAC.
+
+        Query: ?crown_lift_x100=NN (0..40). Missing → C.HAIRLINE_CROWN_LIFT_FRAC.
+        Returns: { "positions": [502*3 floats, OBJ vertex order],
+                   "crown_lift_frac": float }
+        """
+        lift = _parse_crown_lift(request.args.get("crown_lift_x100"))
+        if lift is None:
+            lift = float(C.HAIRLINE_CROWN_LIFT_FRAC)
+
+        cache_key = ("canonical_positions", lift)
+        cached = preview_data_cache.get(cache_key)
+        if cached is not None:
+            preview_data_cache.move_to_end(cache_key)
+            return jsonify(cached)
+
+        # Re-run the same arc + face-up-lift formula as build_extended_obj,
+        # in-memory, without rewriting the OBJ. canonical_extension_positions
+        # is the single source of truth shared with the build script.
+        if __package__ is None or __package__ == "":
+            from python.build_extended_obj import (
+                build_inverse_index_map,
+                canonical_extension_positions,
+            )
+        else:
+            from .build_extended_obj import (
+                build_inverse_index_map,
+                canonical_extension_positions,
+            )
+
+        base_mesh = read_obj(os.path.join(PROJECT_DIR, "face.obj"))
+        inv = build_inverse_index_map()
+        middle, hairline = canonical_extension_positions(base_mesh, inv, crown_lift_frac=lift)
+
+        positions: list[float] = []
+        for x, y, z in base_mesh.positions:           # 468 MP vertices
+            positions.extend((float(x), float(y), float(z)))
+        for row in (middle, hairline):                # 17 + 17 extension vertices
+            for x, y, z in row:
+                positions.extend((float(x), float(y), float(z)))
+
+        result = {"positions": positions, "crown_lift_frac": float(lift)}
+        _store_preview_data(cache_key, result)
+        return jsonify(result)
 
     @app.get("/preview/assets/texture0.png")
     def preview_asset_texture():
