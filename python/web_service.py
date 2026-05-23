@@ -31,20 +31,48 @@ import numpy as np
 
 if __package__ is None or __package__ == "":
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from python import constants as C  # noqa: F401  (kept for future use)
+    from python import constants as C
     from python.face_landmarks import FaceLandmarker, SolutionsFaceLandmarker
     from python.face_parsing import FaceParser
     from python.hairline_2d import (
         sample_hairline_lateral_extend_dense,
+        sample_lateral_extension,
         smooth_hairline_corner_aware,
     )
+    from python.head_ellipsoid import fit_head_ellipsoid
+    from python.lift_3d import (
+        build_middle_row,
+        lift_hairline_to_3d,
+        lift_lateral_to_3d,
+        assemble_full_v2,
+    )
+    from python.visualize_headext import (
+        render_silhouette_panel,
+        render_points_panel,
+        render_depth_panel,
+        hstack as hstack_panels,
+    )
 else:
-    from . import constants as C  # noqa: F401
+    from . import constants as C
     from .face_landmarks import FaceLandmarker, SolutionsFaceLandmarker
     from .face_parsing import FaceParser
     from .hairline_2d import (
         sample_hairline_lateral_extend_dense,
+        sample_lateral_extension,
         smooth_hairline_corner_aware,
+    )
+    from .head_ellipsoid import fit_head_ellipsoid
+    from .lift_3d import (
+        build_middle_row,
+        lift_hairline_to_3d,
+        lift_lateral_to_3d,
+        assemble_full_v2,
+    )
+    from .visualize_headext import (
+        render_silhouette_panel,
+        render_points_panel,
+        render_depth_panel,
+        hstack as hstack_panels,
     )
 
 
@@ -125,6 +153,64 @@ def _params_to_kwargs(params: dict) -> dict:
         "outer_per_side": None if params["outer_per_side"] < 0 else params["outer_per_side"],
         "density_run_length": params["density_run_length"],
     }
+
+
+# ---------------------------------------------------------------------------
+# v2-headext slider schema
+# ---------------------------------------------------------------------------
+
+HEADEXT_PARAM_SCHEMA: tuple[dict, ...] = (
+    dict(key="lateral_max_walk_ratio_x100", label="lateral 外推幅度 × 100",
+         type="int", min=2, max=30, step=1, default=15,
+         hint="lateral 锚点沿垂直 face-up 方向向外行走的最大像素 = 图宽 × N/100。"),
+    dict(key="lateral_mid_t_x100", label="mid 行内插系数 × 100",
+         type="int", min=20, max=80, step=1, default=50,
+         hint="mid_xy = lerp(MP锚点, out_xy, t)。50 = 居中, 越大越靠近 out。"),
+    dict(key="use_full_silhouette", label="silhouette = skin ∪ all-hair",
+         type="bool", default=True,
+         hint="ON: 用整个 skin+hair 作为 lateral 外缘 mask (推荐)。OFF: 只用面部毗邻的 hair。"),
+    dict(key="ellipsoid_axis_margin_x100", label="椭球半轴放大 × 100 (axis_margin)",
+         type="int", min=100, max=160, step=1, default=130,
+         hint="MP bbox 半轴 × N/100, 决定椭球 (a, b) 的大小。≥130 才能罩住 ear+hair 外缘。"),
+    dict(key="ellipsoid_depth_to_width_x100", label="头深 / 头宽比 × 100 (c/a)",
+         type="int", min=70, max=160, step=1, default=115,
+         hint="c = max(a, b) × N/100。真人头骨 ≈ 1.10~1.20。"),
+    dict(key="ellipsoid_center_depth_offset_x100", label="椭球中心后移系数 × 100",
+         type="int", min=10, max=60, step=1, default=35,
+         hint="cz = z_front - z_front_sign × c × N/100。越大椭球中心越靠后, lateral 点 Z 越浅。"),
+    dict(key="ellipsoid_axes_clip_ratio_x100", label="ellipsoid axes 限幅 × 100",
+         type="int", min=50, max=150, step=1, default=100,
+         hint="椭球解算时, |z-cz| 的上限 = N/100 × c。越小越不容易往背部跳。"),
+    dict(key="show_silhouette_panel", label="第 1 列: silhouette + 射线",
+         type="bool", default=True, hint="关闭可缩短渲染时间。"),
+    dict(key="show_points_panel", label="第 2 列: 522 点 + ribbon",
+         type="bool", default=True, hint=""),
+    dict(key="show_depth_panel", label="第 3 列: Z 深度着色",
+         type="bool", default=True, hint=""),
+)
+HEADEXT_PARAM_DEFAULTS: dict = {p["key"]: p["default"] for p in HEADEXT_PARAM_SCHEMA}
+
+
+def _normalize_headext_params(raw: dict) -> dict:
+    out = dict(HEADEXT_PARAM_DEFAULTS)
+    for schema in HEADEXT_PARAM_SCHEMA:
+        key = schema["key"]
+        if key not in raw:
+            continue
+        v = raw[key]
+        if schema["type"] == "int":
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+            v = max(schema["min"], min(schema["max"], v))
+        elif schema["type"] == "bool":
+            if isinstance(v, str):
+                v = v.lower() in ("1", "true", "yes", "on")
+            else:
+                v = bool(v)
+        out[key] = v
+    return out
 
 
 @dataclass(frozen=True)
@@ -298,6 +384,101 @@ class HairlineWebAnalyzer:
             "curve_filename": curve_filename,
             "n_total": int(len(valid)),
             "n_valid": int(valid.sum()),
+            "elapsed_ms": elapsed,
+        }
+
+    def render_headext(self, stem: str, params: dict, out_dir: str) -> dict:
+        """Run the full v2-headext pipeline with the given params + render 3 panels."""
+        cache = self._cache.get(stem)
+        if cache is None:
+            raise KeyError("缓存里没有这张图, 请重新上传。")
+        if cache["landmarks"] is None:
+            raise RuntimeError("当前 backend 不返回 landmarks (parsing 模式), 无法跑 headext。")
+
+        rgb = cache["rgb"]
+        parse_map = cache["parse_map"]
+        landmarks = cache["landmarks"]
+
+        started = time.perf_counter()
+        with self._lock:
+            self._cache.move_to_end(stem)
+
+            # v1 hairline + middle (fixed defaults — they aren't tuned here;
+            # use the /hairline page for that). 17 anchor pts subsampled from
+            # the dense pipeline so the 502 stitching still works.
+            hairline_dense, _ = sample_hairline_lateral_extend_dense(
+                landmarks, parse_map, intermediates=1,
+            )
+            hairline_17 = hairline_dense[::2]
+            if hairline_17.shape[0] != C.N_ANCHORS:
+                hairline_17 = hairline_dense[:C.N_ANCHORS]
+            valid_17 = np.ones(C.N_ANCHORS, dtype=bool)
+            hairline_smoothed = smooth_hairline_corner_aware(
+                hairline_17.copy(), valid_17, iterations=2,
+            )
+            hairline_3d = lift_hairline_to_3d(landmarks, hairline_smoothed)
+            middle_3d = build_middle_row(landmarks, hairline_3d)
+
+            # v2 lateral ribbon
+            lateral_mid_xy, lateral_out_xy, lateral_valid = sample_lateral_extension(
+                landmarks, parse_map,
+                max_walk_ratio=params["lateral_max_walk_ratio_x100"] / 100.0,
+                mid_t=params["lateral_mid_t_x100"] / 100.0,
+                use_full_silhouette=bool(params["use_full_silhouette"]),
+            )
+            ellipsoid = fit_head_ellipsoid(
+                landmarks,
+                axis_margin=params["ellipsoid_axis_margin_x100"] / 100.0,
+                depth_to_width_ratio=params["ellipsoid_depth_to_width_x100"] / 100.0,
+                center_depth_offset=params["ellipsoid_center_depth_offset_x100"] / 100.0,
+            )
+            lateral_mid_3d, lateral_out_3d, in_envelope = lift_lateral_to_3d(
+                landmarks, lateral_out_xy, lateral_mid_xy, ellipsoid,
+                axes_clip_ratio=params["ellipsoid_axes_clip_ratio_x100"] / 100.0,
+            )
+
+            pts_522 = assemble_full_v2(
+                landmarks, middle_3d, hairline_3d, lateral_mid_3d, lateral_out_3d,
+            )
+
+            panels: list[np.ndarray] = []
+            captions: list[str] = []
+            if params["show_silhouette_panel"]:
+                panels.append(render_silhouette_panel(
+                    rgb, parse_map, landmarks,
+                    lateral_mid_xy, lateral_out_xy, lateral_valid,
+                ))
+                captions.append("silhouette + lateral rays")
+            if params["show_points_panel"]:
+                panels.append(render_points_panel(rgb, pts_522, lateral_valid))
+                captions.append("522 verts + ribbon wireframe")
+            if params["show_depth_panel"]:
+                panels.append(render_depth_panel(rgb, pts_522))
+                captions.append("Z depth coloring")
+
+            if not panels:
+                # User unchecked everything → fall back to depth so the page
+                # never goes blank.
+                panels.append(render_depth_panel(rgb, pts_522))
+                captions.append("Z depth coloring")
+
+            overlay = hstack_panels(panels)
+            overlay_filename = f"{stem}_headext_overlay.png"
+            _save_rgb(os.path.join(out_dir, overlay_filename), overlay)
+
+        elapsed = int((time.perf_counter() - started) * 1000)
+        return {
+            "overlay_filename": overlay_filename,
+            "panel_count": len(panels),
+            "captions": captions,
+            "lateral_valid": int(lateral_valid.sum()),
+            "lateral_in_envelope": int(in_envelope.sum()),
+            "ellipsoid": {
+                "center": [ellipsoid.cx, ellipsoid.cy, ellipsoid.cz],
+                "axes": [ellipsoid.a, ellipsoid.b, ellipsoid.c],
+                "z_front_sign": int(ellipsoid.z_front_sign),
+                "residual": float(ellipsoid.mean_residual),
+            },
             "elapsed_ms": elapsed,
         }
 
@@ -480,6 +661,7 @@ INDEX_HTML = """
 <body>
   <main class="page">
     <section class="hero">
+      <div style="float:right;font-size:13px;"><a href="/headext" style="color:#2563eb;text-decoration:none;">→ 切到 /headext 调头部扩展 mesh (522 顶点)</a></div>
       <h1>发际线分析 · lateral_extend_dense 实时调参</h1>
       <p class="muted">上传一张正脸照片后, 在左侧滑块上调整任何参数都会立即重新渲染发际线 (parse map + landmarks 只在上传时跑一次)。</p>
       <form action="/hairline/analyze" method="post" enctype="multipart/form-data">
@@ -677,6 +859,213 @@ INDEX_HTML = """
 """
 
 
+HEADEXT_HTML = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>头部扩展 3D mesh · v2-headext 实时调参</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f7fb; color: #1f2937; }
+    body { margin: 0; }
+    .page { max-width: 1480px; margin: 0 auto; padding: 28px 20px 48px; }
+    .hero, .card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 16px; padding: 22px; box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05); }
+    h1 { margin: 0 0 10px; font-size: 26px; }
+    p { line-height: 1.6; margin: 0 0 8px; }
+    .muted { color: #6b7280; font-size: 14px; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-family: ui-monospace, monospace; margin-right: 6px; }
+    .pill.v1 { background: #fef3c7; color: #92400e; }
+    .pill.v2 { background: #dbeafe; color: #1e3a8a; }
+    form { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 16px; }
+    input[type=file] { flex: 1 1 320px; border: 1px dashed #9ca3af; border-radius: 10px; background: #f9fafb; padding: 12px; }
+    button.primary { border: 0; border-radius: 10px; background: #2563eb; color: white; font-weight: 700; padding: 12px 20px; cursor: pointer; }
+    button.primary:hover { background: #1d4ed8; }
+    .error { margin-top: 16px; padding: 12px 14px; border-radius: 10px; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; white-space: pre-wrap; }
+    .layout { margin-top: 22px; display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 18px; }
+    @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
+    .controls .control { margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px dashed #e5e7eb; }
+    .controls .control:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
+    .controls label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
+    .controls .row { display: flex; align-items: center; gap: 8px; }
+    .controls input[type=range] { flex: 1; }
+    .controls .val { min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; color: #1d4ed8; font-weight: 700; }
+    .controls .hint { display: block; font-size: 11px; color: #6b7280; margin-top: 6px; line-height: 1.4; }
+    .meta { margin: 8px 0 14px; padding: 10px 12px; border-radius: 10px; background: #eff6ff; color: #1e3a8a; border: 1px solid #bfdbfe; font-size: 13px; font-family: ui-monospace, monospace; line-height: 1.6; word-break: break-all; }
+    figure { margin: 0; }
+    figure img { width: 100%; height: auto; border-radius: 12px; background: #111827; display: block; }
+    figcaption { margin-top: 6px; font-size: 12px; color: #6b7280; text-align: center; }
+    .reset { background: transparent; color: #6b7280; border: 1px solid #d1d5db; border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; margin-top: 6px; }
+    .reset:hover { color: #1f2937; border-color: #6b7280; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #e0e7ff; color: #1e3a8a; font-size: 12px; margin-left: 4px; font-family: ui-monospace, monospace; }
+    .status { font-size: 12px; color: #6b7280; margin-left: 8px; }
+    .status.busy { color: #b45309; } .status.err { color: #991b1b; }
+    .original-strip { margin-top: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .original-strip img { max-height: 96px; border-radius: 8px; background: #111827; }
+    .original-strip small { color: #6b7280; }
+    .nav-links { float: right; font-size: 13px; }
+    .nav-links a { color: #2563eb; text-decoration: none; margin-left: 8px; }
+    .nav-links a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="nav-links"><a href="/hairline">→ 切到 /hairline 调发际线</a></div>
+      <h1>头部扩展 mesh · v2-headext 实时调参 <span class="badge">522 顶点</span></h1>
+      <p class="muted">在 MP 468 + 17 middle + 17 hairline 之上, 额外添加 <span class="pill v2">lateral_mid × 10</span> + <span class="pill v2">lateral_out × 10</span>, 覆盖太阳穴 → 颧弓 → 耳前的外圈, 让贴图能延伸到额头与脸颊侧面。</p>
+      <form action="/headext/analyze" method="post" enctype="multipart/form-data">
+        <input type="file" name="image" accept="image/png,image/jpeg,image/webp" required>
+        <button class="primary" type="submit">上传 / 开始分析</button>
+      </form>
+      {% if error %}<div class="error">{{ error }}</div>{% endif %}
+      {% if init %}
+      <div class="original-strip">
+        <img src="{{ init.original_url }}" alt="上传的原图">
+        <small>文件 <b>{{ init.original_name }}</b> · backend <b>{{ init.backend }}</b> · parse+landmark 用时 {{ init.prepare_ms }} ms · stem <code>{{ init.stem }}</code></small>
+      </div>
+      {% endif %}
+    </section>
+
+    {% if init %}
+    <section class="layout">
+      <aside class="card controls">
+        <h2 style="margin:0 0 12px; font-size:16px;">参数调节
+          <span class="badge">v2-headext</span>
+          <span class="status" id="status">--</span>
+        </h2>
+        <div id="ctrl_root"></div>
+        <button class="reset" id="reset_btn" type="button">↺ 重置全部参数</button>
+      </aside>
+      <article class="card">
+        <div class="meta" id="meta">--</div>
+        <figure>
+          <img id="img_overlay" src="" alt="v2-headext 三联可视化">
+          <figcaption>silhouette + 522 点 + Z 着色</figcaption>
+        </figure>
+      </article>
+    </section>
+
+    <script>
+    (function () {
+      const STEM = {{ init.stem|tojson }};
+      const SCHEMA = {{ init.param_schema|tojson }};
+      const INIT_PARAMS = {{ init.initial_params|tojson }};
+      const INIT_RESULT = {{ init.initial_render|tojson }};
+
+      const $ = id => document.getElementById(id);
+      const root = $("ctrl_root");
+      const status = $("status");
+
+      function makeControl(s, value) {
+        const wrap = document.createElement("div"); wrap.className = "control";
+        const label = document.createElement("label"); label.htmlFor = "p_" + s.key; label.textContent = s.label;
+        wrap.appendChild(label);
+        const row = document.createElement("div"); row.className = "row";
+        let input;
+        if (s.type === "bool") {
+          input = document.createElement("input");
+          input.type = "checkbox"; input.id = "p_" + s.key; input.checked = !!value;
+        } else {
+          input = document.createElement("input");
+          input.type = "range"; input.id = "p_" + s.key;
+          input.min = s.min; input.max = s.max; input.step = s.step; input.value = value;
+        }
+        row.appendChild(input);
+        const valSpan = document.createElement("span"); valSpan.className = "val";
+        valSpan.id = "p_" + s.key + "_val";
+        valSpan.textContent = (s.type === "bool") ? (value ? "ON" : "OFF") : String(value);
+        row.appendChild(valSpan); wrap.appendChild(row);
+        if (s.hint) { const h = document.createElement("span"); h.className = "hint"; h.textContent = s.hint; wrap.appendChild(h); }
+        return { wrap, input, valSpan };
+      }
+
+      const inputs = {};
+      SCHEMA.forEach(s => {
+        const { wrap, input, valSpan } = makeControl(s, INIT_PARAMS[s.key]);
+        root.appendChild(wrap);
+        inputs[s.key] = { input, valSpan, schema: s };
+      });
+
+      function readParams() {
+        const out = {};
+        for (const [k, { input, schema }] of Object.entries(inputs)) {
+          if (schema.type === "bool") out[k] = input.checked;
+          else out[k] = parseInt(input.value, 10);
+        }
+        return out;
+      }
+
+      function applyResult(j) {
+        const t = Date.now();
+        $("img_overlay").src = "/headext/outputs/" + j.overlay_filename + "?t=" + t;
+        const ell = j.ellipsoid;
+        $("meta").innerHTML =
+          "渲染 " + j.elapsed_ms + " ms · 面板 " + j.panel_count +
+          " · lateral_valid " + j.lateral_valid + "/10" +
+          " · lateral_in_envelope " + j.lateral_in_envelope + "/20<br>" +
+          "ellipsoid center (" + ell.center.map(x => x.toFixed(3)).join(", ") +
+          ") · axes (" + ell.axes.map(x => x.toFixed(3)).join(", ") +
+          ") · z_front_sign " + (ell.z_front_sign > 0 ? "+1" : "-1") +
+          " · residual " + ell.residual.toFixed(4);
+      }
+
+      let renderSeq = 0; let pendingTimer = null;
+      async function render() {
+        const seq = ++renderSeq;
+        status.textContent = "渲染中…"; status.className = "status busy";
+        try {
+          const r = await fetch("/headext/api/render", {
+            method: "POST", headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({ stem: STEM, params: readParams() })
+          });
+          if (!r.ok) {
+            const t = await r.text();
+            if (seq === renderSeq) { status.textContent = "错误: " + t; status.className = "status err"; }
+            return;
+          }
+          const j = await r.json();
+          if (seq !== renderSeq) return;
+          applyResult(j);
+          status.textContent = "✓ 已更新"; status.className = "status";
+        } catch (e) {
+          if (seq === renderSeq) { status.textContent = "错误: " + e; status.className = "status err"; }
+        }
+      }
+      function scheduleRender() {
+        if (pendingTimer) clearTimeout(pendingTimer);
+        pendingTimer = setTimeout(() => { pendingTimer = null; render(); }, 250);
+      }
+
+      Object.entries(inputs).forEach(([k, { input, valSpan, schema }]) => {
+        const refresh = () => {
+          valSpan.textContent = (schema.type === "bool") ? (input.checked ? "ON" : "OFF") : input.value;
+          scheduleRender();
+        };
+        input.addEventListener("input", refresh);
+        input.addEventListener("change", refresh);
+      });
+
+      $("reset_btn").addEventListener("click", () => {
+        SCHEMA.forEach(s => {
+          const { input, valSpan } = inputs[s.key];
+          if (s.type === "bool") { input.checked = !!s.default; valSpan.textContent = input.checked ? "ON" : "OFF"; }
+          else { input.value = s.default; valSpan.textContent = String(s.default); }
+        });
+        scheduleRender();
+      });
+
+      applyResult(INIT_RESULT);
+      status.textContent = "✓ 初始渲染"; status.className = "status";
+    })();
+    </script>
+    {% endif %}
+  </main>
+</body>
+</html>
+"""
+
+
 def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
     from flask import (
         Flask,
@@ -763,6 +1152,70 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
     def hairline_outputs(filename: str):
         return send_from_directory(WEB_DATA_DIR, filename)
 
+    # ----- v2-headext routes ------------------------------------------------
+    @app.get("/headext")
+    def headext_index():
+        return render_template_string(HEADEXT_HTML, init=None, error=None)
+
+    @app.post("/headext/analyze")
+    def headext_analyze():
+        upload = request.files.get("image")
+        if upload is None or upload.filename == "":
+            return render_template_string(HEADEXT_HTML, init=None, error="请选择一张图片。"), 400
+        if not allowed_file(upload.filename):
+            return render_template_string(
+                HEADEXT_HTML, init=None, error="只支持 jpg、jpeg、png、webp 图片。",
+            ), 400
+
+        safe_name = secure_filename(upload.filename)
+        ext = os.path.splitext(safe_name)[1].lower()
+        stem = f"{uuid.uuid4().hex}_{os.path.splitext(safe_name)[0]}"
+        original_filename = stem + ext
+        original_path = os.path.join(WEB_DATA_DIR, original_filename)
+        upload.save(original_path)
+
+        started = time.perf_counter()
+        try:
+            analyzer.prepare(original_path, stem)
+            initial_render = analyzer.render_headext(stem, dict(HEADEXT_PARAM_DEFAULTS), WEB_DATA_DIR)
+        except Exception as exc:
+            return render_template_string(HEADEXT_HTML, init=None, error=str(exc)), 500
+        prepare_ms = int((time.perf_counter() - started) * 1000)
+
+        init = AnalysisInit(
+            original_name=safe_name,
+            original_url=f"/headext/outputs/{original_filename}",
+            stem=stem,
+            backend=analyzer.landmark_backend,
+            prepare_ms=prepare_ms,
+            initial_render=initial_render,
+            initial_params=dict(HEADEXT_PARAM_DEFAULTS),
+            param_schema=HEADEXT_PARAM_SCHEMA,
+        )
+        return render_template_string(HEADEXT_HTML, init=init, error=None)
+
+    @app.post("/headext/api/render")
+    def headext_api_render():
+        payload = request.get_json(silent=True) or {}
+        stem = payload.get("stem")
+        if not isinstance(stem, str) or not stem:
+            return ("missing stem", 400)
+        raw_params = payload.get("params") or {}
+        if not isinstance(raw_params, dict):
+            return ("params must be an object", 400)
+        params = _normalize_headext_params(raw_params)
+        try:
+            result = analyzer.render_headext(stem, params, WEB_DATA_DIR)
+        except KeyError as exc:
+            return (str(exc), 410)
+        except Exception as exc:
+            return (str(exc), 500)
+        return jsonify(result)
+
+    @app.get("/headext/outputs/<path:filename>")
+    def headext_outputs(filename: str):
+        return send_from_directory(WEB_DATA_DIR, filename)
+
     @app.get("/health")
     def health():
         return {"ok": True, "backend": analyzer.landmark_backend, "cached": list(analyzer._cache.keys())}
@@ -780,6 +1233,8 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
     # Make the schema/params helpers available to tests via app context.
     app.config["PARAM_SCHEMA"] = PARAM_SCHEMA
     app.config["PARAM_DEFAULTS"] = PARAM_DEFAULTS
+    app.config["HEADEXT_PARAM_SCHEMA"] = HEADEXT_PARAM_SCHEMA
+    app.config["HEADEXT_PARAM_DEFAULTS"] = HEADEXT_PARAM_DEFAULTS
 
     return app
 

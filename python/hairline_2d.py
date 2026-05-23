@@ -627,6 +627,121 @@ def sample_hairline_lateral_extend_dense(
     return hairline, valid
 
 
+def build_head_silhouette_mask(parse_map: np.ndarray) -> np.ndarray:
+    """``(face_skin ∪ full_hair)`` 二值 mask, 用于 lateral silhouette 探测。
+
+    左右两侧 lateral 锚点 (MP 127/234/93/132/58 等) 都长在脸侧的皮肤上,
+    需要先穿过整个 head silhouette 才能停在最外侧的 hair / skin 边界。
+    """
+    return build_skin_mask(parse_map) | build_hair_mask(parse_map)
+
+
+def sample_lateral_extension(
+    landmarks_norm: np.ndarray,
+    parse_map: np.ndarray,
+    mp_anchors_left: list[int] | None = None,
+    mp_anchors_right: list[int] | None = None,
+    max_walk_ratio: float = 0.15,
+    use_full_silhouette: bool = True,
+    mid_t: float = 0.5,
+    fallback_extrapolation: float = 0.10,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """对每个 lateral 锚点, 沿"水平向外"方向探测到 head silhouette 外缘。
+
+    返回
+    ----
+    mid_xy:   (2L, 2) float — 中间行点 = lerp(MP锚点, lateral_out, mid_t)
+    out_xy:   (2L, 2) float — 外圈点 = silhouette 外缘像素的前一像素
+    valid:    (2L,)   bool  — 是否真的命中 silhouette 边界 (False = 用 fallback)
+
+    顺序: ``left_0 .. left_{L-1}, right_0 .. right_{L-1}`` (L = N_LATERAL_PER_SIDE)。
+
+    方向定义
+    --------
+    face-up = chin (MP 152) → forehead top (MP 10), 单位 norm 向量。
+    perp = (-up.y, up.x): 左脸为负 (perp 方向取负), 右脸为正 (perp 方向取正)。
+    """
+    if mp_anchors_left is None:
+        mp_anchors_left = C.MP_LATERAL_ANCHORS_LEFT
+    if mp_anchors_right is None:
+        mp_anchors_right = C.MP_LATERAL_ANCHORS_RIGHT
+
+    if len(mp_anchors_left) != len(mp_anchors_right):
+        raise ValueError("left and right lateral anchor chains must have the same length")
+    L = len(mp_anchors_left)
+    n_total = 2 * L
+
+    H, W = parse_map.shape
+
+    if use_full_silhouette:
+        head = build_head_silhouette_mask(parse_map)
+    else:
+        head = build_skin_mask(parse_map) | build_face_adjacent_hair_mask(parse_map)
+
+    up_norm = face_up_vector(landmarks_norm)
+    up_px = up_norm * np.array([W, H], dtype=np.float64)
+    up_px /= np.linalg.norm(up_px) + 1e-9
+    perp_px = np.array([-up_px[1], up_px[0]], dtype=np.float64)
+
+    max_walk_px = max(2, int(round(W * max_walk_ratio)))
+
+    mid_xy = np.zeros((n_total, 2), dtype=np.float32)
+    out_xy = np.zeros((n_total, 2), dtype=np.float32)
+    valid = np.zeros(n_total, dtype=bool)
+
+    chain = [(mp, -1) for mp in mp_anchors_left] + [(mp, +1) for mp in mp_anchors_right]
+
+    for i, (mp_idx, side_sign) in enumerate(chain):
+        anchor_norm = landmarks_norm[mp_idx, :2]
+        anchor_px = anchor_norm * np.array([W, H], dtype=np.float64)
+        direction = perp_px * side_sign
+
+        # March outward step-by-step, looking for the first OUTSIDE pixel.
+        # The "outer" point is the previous (last inside) pixel, so the ribbon
+        # hugs the silhouette without crossing into background.
+        last_inside = anchor_px.copy()
+        found = False
+        pos = anchor_px.copy()
+        for _ in range(max_walk_px):
+            pos = pos + direction
+            ix = int(round(pos[0]))
+            iy = int(round(pos[1]))
+            if ix < 0 or iy < 0 or ix >= W or iy >= H:
+                found = True
+                break
+            if head[iy, ix]:
+                last_inside = pos.copy()
+            else:
+                found = True
+                break
+
+        if not found:
+            # Walked the full budget and still inside silhouette — use the
+            # farthest point we reached. This usually only happens on
+            # full-head shots where the head spans most of the image.
+            last_inside = pos.copy()
+
+        out_pxf = last_inside
+        out_pxf[0] = float(np.clip(out_pxf[0], 0, W - 1))
+        out_pxf[1] = float(np.clip(out_pxf[1], 0, H - 1))
+
+        # If we never moved at all (anchor already on background), fall back
+        # to a small geometric extrapolation along perp.
+        moved = float(np.linalg.norm(out_pxf - anchor_px))
+        if moved < 1.0:
+            out_pxf = anchor_px + direction * (W * fallback_extrapolation)
+            out_pxf[0] = float(np.clip(out_pxf[0], 0, W - 1))
+            out_pxf[1] = float(np.clip(out_pxf[1], 0, H - 1))
+            valid[i] = False
+        else:
+            valid[i] = True
+
+        out_xy[i] = (out_pxf / np.array([W, H])).astype(np.float32)
+        mid_xy[i] = ((1.0 - mid_t) * anchor_norm + mid_t * out_xy[i]).astype(np.float32)
+
+    return mid_xy, out_xy, valid
+
+
 def sample_hairline_converging(landmarks_norm: np.ndarray, parse_map: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """策略 3: 每个锚点的射线方向都收敛到头顶上方目标点。"""
     mask = build_hair_mask(parse_map)

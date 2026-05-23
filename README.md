@@ -28,7 +28,8 @@ head3d/
 ├── README.md                # 当前说明
 ├── requirements.txt         # Python 依赖
 ├── face.obj                 # 原始 MediaPipe canonical mesh，468 个顶点，852 个三角面
-├── face_ext.obj             # 生成后的扩展 mesh，502 个顶点，916 个三角面
+├── face_ext.obj             # v1：额头扩展 mesh，502 个顶点，916 个三角面
+├── face_ext_v2.obj          # v2：v1 + 20 个 lateral 顶点 (522 v, 948 tri)
 ├── python/
 │   ├── constants.py             # 关键常量：17 个锚点、顶点布局、Z 偏移、UV、分割类别
 │   ├── obj_io.py                # 简单 OBJ 读写器
@@ -37,9 +38,16 @@ head3d/
 │   ├── hairline_2d.py           # 发际线 2D 识别：mask + 射线搜索 + 平滑 + 回退
 │   ├── lift_3d.py               # 2D 发际线点提升到 3D，并生成中间行
 │   ├── build_extended_obj.py    # 一次性生成 face_ext.obj
-│   ├── extract_hairline.py      # 主入口：图片 -> 502 点 JSON
-│   ├── visualize.py             # 调试可视化：分割、锚点射线、扩展网格
+│   ├── extract_hairline.py      # 主入口 (v1)：图片 -> 502 点 JSON
+│   ├── extract_headext.py       # 主入口 (v2)：图片 -> 522 点 JSON (含 lateral)
+│   ├── head_ellipsoid.py        # v2：468 MP 点 -> 解剖学头部椭球 + Z 解算
+│   ├── visualize.py             # 调试可视化 (v1)
+│   ├── visualize_headext.py     # 调试可视化 (v2)：silhouette / 522 点 / Z 三联图
+│   ├── web_service.py           # 本地 web 服务 (/hairline + /headext)
+│   ├── uv_template.py           # 输出 UV 布局参考图
 │   └── _index_map_data.py       # 从 SDK 提取的 468 点 indexMap
+├── tools/
+│   └── gen_face_ext_v2.py       # 一次性生成 face_ext_v2.obj
 ├── sdk/
 │   ├── ExtensionConstants.h     # C++ 侧尺寸、锚点、502 项 indexMap
 │   ├── ExtensionLoader.h/.cpp   # 读取 Python 输出 JSON，转成 float[502*3]
@@ -521,6 +529,124 @@ UV_HAIRLINE_V = 0.005
 ```bash
 python python/build_extended_obj.py
 ```
+
+## v2-headext：把网格再往外扩 20 个点 (522 顶点)
+
+v1 (`face_ext.obj`, 502 点) 只在额头方向加了一条带。v2 (`face_ext_v2.obj`, 522 点) 在 v1 基础上再加一圈侧脸外圈点，让贴图能延伸到 **太阳穴 → 颧弓 → 耳前** 一带，方便做美妆、贴花、侧脸特效。
+
+设计与实施细节见 [PLAN_headext.md](PLAN_headext.md)。
+
+### v2 拓扑速览
+
+```
+v2: 522 顶点 = 468 MP + 17 v1 middle + 17 v1 hairline + 10 lateral_mid + 10 lateral_out
+v2: 948 三角面 = 916 v1 + 32 lateral ribbon
+```
+
+| 段 | 下标 | 数量 | 来源 |
+|----|------|------|------|
+| MediaPipe | `0..467` | 468 | `FaceLandmarker` |
+| v1 middle | `468..484` | 17 | `build_middle_row()` |
+| v1 hairline | `485..501` | 17 | `sample_hairline_lateral_extend_dense()` + `smooth_hairline_corner_aware()` |
+| **lateral_mid** | `502..511` | 10 | `sample_lateral_extension()` + `lift_lateral_to_3d()` |
+| **lateral_out** | `512..521` | 10 | 同上 |
+
+lateral 顺序统一为：左 5 (top→bottom: 太阳穴→耳前) + 右 5 (top→bottom)，与 `MP_LATERAL_ANCHORS_LEFT + MP_LATERAL_ANCHORS_RIGHT` 一一对应。每侧锚点链 `[127/356, 234/454, 93/323, 132/361, 58/288]`。
+
+### 算法管线 (v2 部分)
+
+1. **2D 外圈检测** (`sample_lateral_extension`)：从每个 lateral MP 锚点出发，沿 face-up 的垂直方向 (左脸 -X，右脸 +X) 行进，遇到 `skin ∪ all-hair` silhouette 边界停下，停下前的最后一个像素就是 `lateral_out`。`lateral_mid` 取 `lerp(MP锚点, lateral_out, 0.5)`。
+2. **椭球先验** (`fit_head_ellipsoid`)：用 468 MP 点的 XY 包围盒 + 解剖学先验 (axis_margin=1.30, depth/width=1.15, center_depth_offset=0.35) 估计一个轴对齐椭球。**不用纯算法 LSQ 拟合**，因为 468 点只覆盖头部前半层会得到 saddle 解。
+3. **3D Z 解算** (`lift_lateral_to_3d`)：对每个 lateral 2D 点 `(x, y)`，把椭球方程 `((x-cx)/a)² + ((y-cy)/b)² + ((z-cz)/c)² = 1` 当作 z 的一元二次解，选靠 `z_front_sign` 一侧的根；落到 xy-envelope 外时回退最近 MP 锚点的 Z。
+4. **拼装**：`assemble_full_v2` 把 468 + 17 + 17 + 10 + 10 = 522 个 (x, y, z) 顺序连起来。
+
+### CLI
+
+```bash
+python -m python.extract_headext path/to/photo.jpg --out data/photo_v2.json
+```
+
+输出 JSON 在 v1 schema 上增量：
+
+```json
+{
+  "version": "v2-headext",
+  "n_total": 522,
+  "layout": [
+    "mp[0..468)", "middle[468..485)", "hairline[485..502)",
+    "lateral_mid[502..512)", "lateral_out[512..522)"
+  ],
+  "points": [[x, y, z], ...],          // length 522
+  "valid_hairline":        [...],       // length 17
+  "valid_lateral":         [...],       // length 10
+  "lateral_in_envelope":   [...],       // length 20 (mid then out)
+  "ellipsoid": { "center": [...], "axes": [...], "z_front_sign": 1, "residual": 0.59 }
+}
+```
+
+可调参数：
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--landmark-backend` | `subprocess` | 同 v1 |
+| `--lateral-max-walk-ratio` | `0.15` | 外圈点沿 perp 方向走出的最大像素 = 图宽 × 该值 |
+| `--hairline-intermediates` | `1` | 给 `lateral_extend_dense` 用，1 → 33 点然后下采样到 17 |
+
+### 调试三联图
+
+```bash
+python -m python.visualize_headext path/to/photo.jpg --out data/v2_overlay.png
+```
+
+输出依次：silhouette + 10 条 lateral 射线 / 522 点 + 32 条 lateral ribbon wireframe / Z 着色 (红=近 蓝=远)。
+
+### Web 服务 (实时调参)
+
+`/headext` 页面专门调 v2 lateral 参数 (与 `/hairline` 共享同一个 LRU 缓存)，10 个 slider：
+
+| key | 默认 | 含义 |
+|-----|------|------|
+| `lateral_max_walk_ratio_x100` | 15 | 同 CLI |
+| `lateral_mid_t_x100` | 50 | mid 点的内插系数 (50=居中, 80=贴近 out) |
+| `use_full_silhouette` | ON | silhouette 用 `skin ∪ all-hair`；OFF 时只用面部毗邻 hair |
+| `ellipsoid_axis_margin_x100` | 130 | 椭球 (a, b) 相对 MP 包围盒的放大系数 |
+| `ellipsoid_depth_to_width_x100` | 115 | c = max(a, b) × 该值 / 100 |
+| `ellipsoid_center_depth_offset_x100` | 35 | 椭球中心相对前脸的后移系数 |
+| `ellipsoid_axes_clip_ratio_x100` | 100 | 超出 envelope 时 z 的限幅系数 |
+| `show_silhouette_panel` / `show_points_panel` / `show_depth_panel` | ON | 单独勾选要渲染的面板 |
+
+HTTP：
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/headext` | GET | 上传页 |
+| `/headext/analyze` | POST (multipart) | 上传 + 用默认参数渲染一次 |
+| `/headext/api/render` | POST (json `{stem, params}`) | 用新参数重渲染 (仅 CPU, 100~300 ms) |
+| `/headext/outputs/<filename>` | GET | overlay PNG |
+
+`/hairline` 页右上角有跳转链接；两个页面共享 stem，上传一次即可两边来回调。
+
+### 生成 `face_ext_v2.obj`
+
+```bash
+python -m tools.gen_face_ext_v2
+python python/check_ext_obj.py --all     # 校验 v1 + v2
+```
+
+`face_ext_v2.obj` 在 `face_ext.obj` 基础上追加 20 个 lateral 顶点 + 32 个三角面，前 502 个顶点 / UV / 法线 / 916 个三角面完全不变。
+
+### v2 UV 在贴图哪个位置
+
+为了不冲突已有贴图 (`imgs/texture0.png` 占 image y ≈ 229..460), v2 把 lateral 20 个顶点的 UV 放到当前 **未使用的图像顶部** (image y ≈ 0..115, 也就是 OBJ raw V ≈ 0.77..1.0)：
+
+| 行 | OBJ raw V | image y (512 px) | 用途 |
+|----|-----------|------------------|------|
+| `UV_LATERAL_OUT_V` | 0.92 | ≈ 41 | 外圈 10 点 |
+| `UV_LATERAL_MID_V` | 0.86 | ≈ 72 | 中间 10 点 |
+
+每条横带又分左右两段 (U=0.05..0.45 左 / U=0.55..0.95 右)，每段铺 5 个锚点。常量定义在 `python/constants.py` 的 `UV_LATERAL_*`，配套函数 `lateral_uv_for(row, side, col)`。
+
+用 `python/uv_template.py` 可以画一张当前 UV 布局图，叠到 `texture0.png` 上方便重绘贴图。
 
 ## C++ SDK 接入
 

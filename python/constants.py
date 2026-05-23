@@ -76,6 +76,66 @@ def extension_uv_for(row: int, col: int) -> tuple[float, float]:
     return (u, v)
 
 
+# ---------------------------------------------------------------------------
+# v2-headext: lateral extension along temples / cheeks
+# ---------------------------------------------------------------------------
+#
+# Lateral anchor chain on each side, ordered TOP -> BOTTOM
+# (太阳穴上→颧骨外侧→耳前)。
+#
+#   MP 127 / 356 : 太阳穴上, 同时是 v1-hairline 的 1/17 号锚点
+#   MP 234 / 454 : 太阳穴下, 同时是 v1-hairline 的 2/16 号锚点
+#   MP  93 / 323 : 颧弓外侧上
+#   MP 132 / 361 : 颧弓外侧中 / 耳前上
+#   MP  58 / 288 : 耳前下 / 腮上 (ribbon 底部终点)
+MP_LATERAL_ANCHORS_LEFT:  list[int] = [127, 234,  93, 132,  58]
+MP_LATERAL_ANCHORS_RIGHT: list[int] = [356, 454, 323, 361, 288]
+N_LATERAL_PER_SIDE = len(MP_LATERAL_ANCHORS_LEFT)  # 5
+N_LATERAL = 2 * N_LATERAL_PER_SIDE  # 10 (per row, left+right concatenated)
+N_LATERAL_EXT = 2 * N_LATERAL       # 20 (mid row + out row)
+
+# Vertex ID layout (v2):
+#   [0       .. 468)         MediaPipe canonical landmarks
+#   [468     .. 485)         v1 middle row 17
+#   [485     .. 502)         v1 hairline row 17
+#   [502     .. 512)         lateral middle row (left 5 + right 5)
+#   [512     .. 522)         lateral outer row (left 5 + right 5)
+LATERAL_MID_START = N_TOTAL              # 502
+LATERAL_OUT_START = N_TOTAL + N_LATERAL  # 512
+N_TOTAL_V2 = N_TOTAL + N_LATERAL_EXT     # 522
+
+
+# v2-headext UV: occupies the unused TOP region of the texture image
+# (image y=[0, 116] in 512px = OBJ V_raw ∈ [0.77, 1.0]). Existing
+# texture0.png has only transparent pixels there, so this band can be
+# used without conflicting with current content. See PLAN_headext.md §5.2.
+UV_LATERAL_OUT_V       = 0.92   # raw OBJ V; outer ribbon → image y ≈ 41
+UV_LATERAL_MID_V       = 0.86   # raw OBJ V; middle ribbon → image y ≈ 72
+UV_LATERAL_U_LEFT_MIN  = 0.05
+UV_LATERAL_U_LEFT_MAX  = 0.45
+UV_LATERAL_U_RIGHT_MIN = 0.55
+UV_LATERAL_U_RIGHT_MAX = 0.95
+
+
+def lateral_uv_for(row: int, side: str, col: int) -> tuple[float, float]:
+    """Return (u, v_raw) UV for the lateral extension vertex.
+
+    row:  0 = middle, 1 = outer.
+    side: 'left' or 'right'.
+    col:  0..N_LATERAL_PER_SIDE-1, top-to-bottom along the lateral chain
+          (i.e. col=0 is closest to the temple top, col=4 is closest to ear).
+    """
+    if side == "left":
+        u_min, u_max = UV_LATERAL_U_LEFT_MIN, UV_LATERAL_U_LEFT_MAX
+    elif side == "right":
+        u_min, u_max = UV_LATERAL_U_RIGHT_MIN, UV_LATERAL_U_RIGHT_MAX
+    else:
+        raise ValueError(f"side must be 'left' or 'right', got {side!r}")
+    u = u_min + (u_max - u_min) * (col / (N_LATERAL_PER_SIDE - 1))
+    v = UV_LATERAL_MID_V if row == 0 else UV_LATERAL_OUT_V
+    return (u, v)
+
+
 # Face-parsing class indices for the jonathandinu/face-parsing
 # SegFormer model (matches CelebAMask-HQ labels):
 PARSE_BG       = 0
