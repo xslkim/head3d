@@ -1,12 +1,9 @@
-"""Self-test: read face_ext{,_v2}.obj back and verify counts + topology integrity.
+"""Self-test: read face_ext.obj back and verify counts + topology integrity.
 
 Usage:
-  python python/check_ext_obj.py             # v1 (face_ext.obj, 502 verts)
-  python python/check_ext_obj.py --v2        # v2 (face_ext_v2.obj, 522 verts)
-  python python/check_ext_obj.py --all       # both
+  python python/check_ext_obj.py             # face_ext.obj, 502 verts
 """
 from __future__ import annotations
-import argparse
 import os
 import sys
 
@@ -44,7 +41,7 @@ def _check_first_n_positions_match(failures: list[str], a_pos, b_pos, n: int, la
             return
 
 
-def _check_v1(base_face_obj_path: str, ext_obj_path: str) -> int:
+def _check(base_face_obj_path: str, ext_obj_path: str) -> int:
     base = read_obj(base_face_obj_path)
     ext = read_obj(ext_obj_path)
 
@@ -84,101 +81,34 @@ def _check_v1(base_face_obj_path: str, ext_obj_path: str) -> int:
     if ext_face_count != expected_ext:
         failures.append(f"extension face count: {ext_face_count} != {expected_ext}")
 
+    # Sanity check: every extension vertex's Z must be >= its source anchor's Z
+    # (sagittal-arc model: head curves backward as you walk up, never forward).
+    for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+        anchor_obj_idx = inv[mp_idx]
+        anchor_z = ext.positions[anchor_obj_idx][2]
+        for slot, name in ((C.MIDDLE_START + i, f"middle[{i}]"),
+                           (C.HAIRLINE_START + i, f"hairline[{i}]")):
+            new_z = ext.positions[slot][2]
+            if new_z < anchor_z - 1e-5:
+                failures.append(
+                    f"{name} (slot {slot}) z={new_z:+.4f} < anchor MP{mp_idx} "
+                    f"z={anchor_z:+.4f}; should be >= anchor z (head curves backward)"
+                )
+
     if failures:
-        print("[v1] FAIL")
+        print("FAIL")
         for s in failures:
             print(" -", s)
         return 1
-    print(f"[v1] OK  v={ext.n_v()} vt={ext.n_vt()} vn={ext.n_vn()} f={ext.n_f()}  "
+    print(f"OK  v={ext.n_v()} vt={ext.n_vt()} vn={ext.n_vn()} f={ext.n_f()}  "
           f"(forehead extension: {C.N_EXT} verts, {ext_face_count} tris)")
     return 0
 
 
-def _check_v2(v1_obj_path: str, v2_obj_path: str) -> int:
-    v1 = read_obj(v1_obj_path)
-    v2 = read_obj(v2_obj_path)
-    failures: list[str] = []
-
-    if v2.n_v() != C.N_TOTAL_V2:
-        failures.append(f"v count: {v2.n_v()} != {C.N_TOTAL_V2}")
-    if v2.n_vt() != C.N_TOTAL_V2:
-        failures.append(f"vt count: {v2.n_vt()} != {C.N_TOTAL_V2}")
-    if v2.n_vn() != C.N_TOTAL_V2:
-        failures.append(f"vn count: {v2.n_vn()} != {C.N_TOTAL_V2}")
-
-    base_face_count = v1.n_f()
-    expected_lateral_tris = 4 * (C.N_LATERAL_PER_SIDE - 1) * 2   # 4 tris × 4 pairs × 2 sides = 32
-    expected_total_faces = base_face_count + expected_lateral_tris
-    if v2.n_f() != expected_total_faces:
-        failures.append(f"face count: {v2.n_f()} != {expected_total_faces}")
-
-    # First N_TOTAL positions (== full v1) must match exactly.
-    _check_first_n_positions_match(failures, v2.positions, v1.positions, C.N_TOTAL, "position")
-
-    _check_index_ranges(failures, v2, C.N_TOTAL_V2)
-
-    # Every v2 lateral vertex must be used in some face.
-    used = set()
-    for face in v2.faces:
-        for pi, _, _ in face:
-            used.add(pi)
-    for i in range(C.N_TOTAL, C.N_TOTAL_V2):
-        if i not in used:
-            failures.append(f"lateral vertex {i} not used in any face")
-
-    # Each lateral face must reference at least one lateral vertex or
-    # a lateral MP anchor.
-    inv = build_inverse_index_map()
-    lateral_anchor_obj_ids = {
-        inv[mp] for mp in (C.MP_LATERAL_ANCHORS_LEFT + C.MP_LATERAL_ANCHORS_RIGHT)
-    }
-    lateral_ids = set(range(C.N_TOTAL, C.N_TOTAL_V2))
-    lateral_face_count = 0
-    for face in v2.faces[base_face_count:]:
-        verts = {face[0][0], face[1][0], face[2][0]}
-        if not (verts & lateral_ids) and not (verts & lateral_anchor_obj_ids):
-            failures.append(f"lateral face has no lateral-extension/anchor verts: {face}")
-        lateral_face_count += 1
-    if lateral_face_count != expected_lateral_tris:
-        failures.append(f"lateral face count: {lateral_face_count} != {expected_lateral_tris}")
-
-    # Lateral UVs must land in the unused top band (V_raw > 0.77 == image y < 116).
-    for i in range(C.N_TOTAL, C.N_TOTAL_V2):
-        _, v_raw = v2.texcoords[i]
-        if v_raw < 0.77:
-            failures.append(
-                f"lateral UV[{i}] v_raw={v_raw:.3f} not in reserved top band (>=0.77)"
-            )
-
-    if failures:
-        print("[v2] FAIL")
-        for s in failures:
-            print(" -", s)
-        return 1
-    print(f"[v2] OK  v={v2.n_v()} vt={v2.n_vt()} vn={v2.n_vn()} f={v2.n_f()}  "
-          f"(lateral extension: {C.N_LATERAL_EXT} verts, {lateral_face_count} tris)")
-    return 0
-
-
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Verify face_ext.obj / face_ext_v2.obj integrity.")
-    ap.add_argument("--v2", action="store_true", help="check face_ext_v2.obj only")
-    ap.add_argument("--all", action="store_true", help="check both face_ext.obj and face_ext_v2.obj")
-    args = ap.parse_args()
-
     face_obj = os.path.join(PROJECT_DIR, "face.obj")
     ext_obj = os.path.join(PROJECT_DIR, "face_ext.obj")
-    ext_v2_obj = os.path.join(PROJECT_DIR, "face_ext_v2.obj")
-
-    rc = 0
-    if args.v2:
-        rc |= _check_v2(ext_obj, ext_v2_obj)
-    elif args.all:
-        rc |= _check_v1(face_obj, ext_obj)
-        rc |= _check_v2(ext_obj, ext_v2_obj)
-    else:
-        rc |= _check_v1(face_obj, ext_obj)
-    return rc
+    return _check(face_obj, ext_obj)
 
 
 if __name__ == "__main__":

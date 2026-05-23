@@ -56,27 +56,39 @@ def canonical_extension_positions(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute default 3D positions for the 17 middle + 17 hairline vertices.
 
-    Strategy: move each MP top anchor up (in -Y, since face.obj has Y growing
-    downward) by a fraction of the face height. Z stays the same as the
-    anchor for simplicity (SDK recomputes normals; runtime data will override
-    these positions per image).
+    Lift Y upward by a fraction of face height (face.obj has +Y growing
+    DOWN, so "up" is -Y). Z is computed with the same sagittal-arc model
+    used at runtime in ``lift_3d.lift_hairline_to_3d`` so the canonical
+    mesh and the per-image detected mesh share the same surface law:
+
+        z_new = z_anchor + (y_new - y_anchor)² / (2 R),
+        R     = HEAD_ARC_RADIUS_FRAC × face_height
+
+    This always pushes the new vertex BACKWARD (+Z in face.obj convention
+    = back of head), so middle / hairline points sit on the head surface
+    rather than floating in front of the face.
     """
     pos = np.array(mesh.positions, dtype=np.float32)  # (468, 3)
     min_y = float(pos[:, 1].min())
     max_y = float(pos[:, 1].max())
     face_h = max_y - min_y
 
-    # Tunable margins, in fraction of canonical face height.
     middle_lift  = 0.05 * face_h
     hairline_lift = 0.12 * face_h
+    R = max(1e-6, C.HEAD_ARC_RADIUS_FRAC * face_h)
 
     middle   = np.zeros((C.N_ANCHORS, 3), dtype=np.float32)
     hairline = np.zeros((C.N_ANCHORS, 3), dtype=np.float32)
     for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
         obj_idx = inv_index_map[mp_idx]
         a = pos[obj_idx]
-        middle[i]   = (a[0], a[1] - middle_lift,   a[2] + C.bulge_z(i))
-        hairline[i] = (a[0], a[1] - hairline_lift, a[2] + C.curve_offset_z(i))
+        y_m = a[1] - middle_lift
+        y_h = a[1] - hairline_lift
+        # dy is negative (above anchor); dy² / (2R) is positive.
+        z_m = float(a[2]) + (y_m - float(a[1])) ** 2 / (2.0 * R)
+        z_h = float(a[2]) + (y_h - float(a[1])) ** 2 / (2.0 * R)
+        middle[i]   = (a[0], y_m, z_m)
+        hairline[i] = (a[0], y_h, z_h)
     return middle, hairline
 
 

@@ -28,26 +28,20 @@ head3d/
 ├── README.md                # 当前说明
 ├── requirements.txt         # Python 依赖
 ├── face.obj                 # 原始 MediaPipe canonical mesh，468 个顶点，852 个三角面
-├── face_ext.obj             # v1：额头扩展 mesh，502 个顶点，916 个三角面
-├── face_ext_v2.obj          # v2：v1 + 20 个 lateral 顶点 (522 v, 948 tri)
+├── face_ext.obj             # 额头扩展 mesh，502 个顶点，916 个三角面
 ├── python/
-│   ├── constants.py             # 关键常量：17 个锚点、顶点布局、Z 偏移、UV、分割类别
+│   ├── constants.py             # 关键常量：17 个锚点、顶点布局、矢状-arc 半径、UV、分割类别
 │   ├── obj_io.py                # 简单 OBJ 读写器
 │   ├── face_landmarks.py        # MediaPipe FaceLandmarker 封装，输出 468 个点
 │   ├── face_parsing.py          # HuggingFace SegFormer 人脸分割封装
 │   ├── hairline_2d.py           # 发际线 2D 识别：mask + 射线搜索 + 平滑 + 回退
-│   ├── lift_3d.py               # 2D 发际线点提升到 3D，并生成中间行
+│   ├── lift_3d.py               # 2D 发际线点提升到 3D，z 用矢状-arc 反解
 │   ├── build_extended_obj.py    # 一次性生成 face_ext.obj
-│   ├── extract_hairline.py      # 主入口 (v1)：图片 -> 502 点 JSON
-│   ├── extract_headext.py       # 主入口 (v2)：图片 -> 522 点 JSON (含 lateral)
-│   ├── head_ellipsoid.py        # v2：468 MP 点 -> 解剖学头部椭球 + Z 解算
-│   ├── visualize.py             # 调试可视化 (v1)
-│   ├── visualize_headext.py     # 调试可视化 (v2)：silhouette / 522 点 / Z 三联图
-│   ├── web_service.py           # 本地 web 服务 (/hairline + /headext)
+│   ├── extract_hairline.py      # 主入口：图片 -> 502 点 JSON
+│   ├── visualize.py             # 调试可视化
+│   ├── web_service.py           # 本地 web 服务 (/hairline + /preview)
 │   ├── uv_template.py           # 输出 UV 布局参考图
 │   └── _index_map_data.py       # 从 SDK 提取的 468 点 indexMap
-├── tools/
-│   └── gen_face_ext_v2.py       # 一次性生成 face_ext_v2.obj
 ├── sdk/
 │   ├── ExtensionConstants.h     # C++ 侧尺寸、锚点、502 项 indexMap
 │   ├── ExtensionLoader.h/.cpp   # 读取 Python 输出 JSON，转成 float[502*3]
@@ -285,34 +279,38 @@ new[i] = 0.25 * p[i - 1] + 0.5 * p[i] + 0.25 * p[i + 1]
 
 只有当前点 `valid[i] == true` 时才会更新该点；无效点会保留回退结果。两端点不参与平滑，避免边界收缩。
 
-### 8. 把 2D 发际线点提升到 3D
+### 8. 把 2D 发际线点提升到 3D —— 矢状-arc 模型
 
-`python/lift_3d.py` 的 `lift_hairline_to_3d()` 会把每个 2D 发际线点变成 3D 点：
+`python/lift_3d.py` 的 `lift_hairline_to_3d()` 把每个 2D 发际线点变成 3D 点：
 
 ```python
 x = hairline_2d[i].x
 y = hairline_2d[i].y
-z = landmarks[MP_TOP_ANCHORS[i]].z + curve_offset_z(i)
+dy = y - landmarks[MP_TOP_ANCHORS[i]].y        # 总是 < 0 (hairline 在 anchor 上方)
+R  = HEAD_ARC_RADIUS_FRAC × face_height        # 默认 0.30 × face_h
+z  = landmarks[MP_TOP_ANCHORS[i]].z + dy² / (2 R)
 ```
 
 也就是说：
 
 - `x`、`y` 来自实际识别到的发际线位置。
-- `z` 继承对应 MediaPipe 额头锚点的深度。
-- 再加一个预设的额头弧度偏移 `curve_offset_z(i)`。
+- `z` 用一个 **矢状-arc (sagittal-arc) 模型** 反解, 把头骨在中线 (x ≈ x_anchor) 上的纵向剖面当成局部圆弧, 半径 R 取脸高的 30 %。
+- `dy² / (2R)` 是圆弧的弦-高近似 `R − R·cos(θ)`, 永远 ≥ 0 → **z 永远 ≥ anchor.z** → 在 MediaPipe / face.obj 约定下 (`-z = 脸前, +z = 头后`), 新点永远朝头后方向偏, 严格落在头骨表面, 而不是浮在脸前。
 
-`curve_offset_z(i)` 是对称余弦形状：中间最深，两侧逐渐变浅。当前最大幅度约为 `-0.04`，目的是让头顶/额头上方看起来略微向后弯，而不是一整条平板。
+> ⚠️ 历史教训: 之前 `curve_offset_z(i) = -0.04 × cos(...)` 把 hairline z 推到 **比额头 anchor 更负 (更靠近相机)**, 等于把所有新点丢到脸的前面飘着。`/preview` 页能看到 `⟨z(hairline) − z(MP anchor)⟩` 这个指标, 应大于 0 才贴合, 这是 bug 没复发的硬性 sanity check。
 
 ### 9. 生成中间行
 
 如果直接把 MediaPipe 上沿连到发际线行，三角面会又长又扁，贴图和光照都不自然。所以项目在中间加一行 17 个点：
 
 ```python
-middle = 0.5 * anchor + 0.5 * hairline
-middle.z += bulge_z(i)
+x = 0.5 * anchor.x + 0.5 * hairline.x
+y = 0.5 * anchor.y + 0.5 * hairline.y
+dy = y - anchor.y
+z = anchor.z + dy² / (2 R)             # 同一个 arc 模型, 自动小于 hairline 那一行
 ```
 
-`bulge_z(i)` 也是对称余弦形状，当前最大幅度约为 `-0.015`，用来给额头区域一点弧度。最终新增的 34 个点就是：
+middle 行用 **同一个** 矢状-arc 模型: 因为 `dy_middle² < dy_hairline²`, middle 的 z 自动落在 anchor 和 hairline 之间, 形成一个连续向后弯的曲面带, 三段贴在头骨上。最终新增的 34 个点就是：
 
 - `middle[0..16]`
 - `hairline[0..16]`
@@ -530,123 +528,25 @@ UV_HAIRLINE_V = 0.005
 python python/build_extended_obj.py
 ```
 
-## v2-headext：把网格再往外扩 20 个点 (522 顶点)
+## /preview 3D 端到端验证页
 
-v1 (`face_ext.obj`, 502 点) 只在额头方向加了一条带。v2 (`face_ext_v2.obj`, 522 点) 在 v1 基础上再加一圈侧脸外圈点，让贴图能延伸到 **太阳穴 → 颧弓 → 耳前** 一带，方便做美妆、贴花、侧脸特效。
+`/preview` 用来肉眼确认 502 点的 3D 位置和 OBJ canonical mesh 是否一致, 是这一轮 "新加的点是否贴皮肤" 的回归检查面板。
 
-设计与实施细节见 [PLAN_headext.md](PLAN_headext.md)。
-
-### v2 拓扑速览
-
-```
-v2: 522 顶点 = 468 MP + 17 v1 middle + 17 v1 hairline + 10 lateral_mid + 10 lateral_out
-v2: 948 三角面 = 916 v1 + 32 lateral ribbon
-```
-
-| 段 | 下标 | 数量 | 来源 |
-|----|------|------|------|
-| MediaPipe | `0..467` | 468 | `FaceLandmarker` |
-| v1 middle | `468..484` | 17 | `build_middle_row()` |
-| v1 hairline | `485..501` | 17 | `sample_hairline_lateral_extend_dense()` + `smooth_hairline_corner_aware()` |
-| **lateral_mid** | `502..511` | 10 | `sample_lateral_extension()` + `lift_lateral_to_3d()` |
-| **lateral_out** | `512..521` | 10 | 同上 |
-
-lateral 顺序统一为：左 5 (top→bottom: 太阳穴→耳前) + 右 5 (top→bottom)，与 `MP_LATERAL_ANCHORS_LEFT + MP_LATERAL_ANCHORS_RIGHT` 一一对应。每侧锚点链 `[127/356, 234/454, 93/323, 132/361, 58/288]`。
-
-### 算法管线 (v2 部分)
-
-1. **2D 外圈检测** (`sample_lateral_extension`)：从每个 lateral MP 锚点出发，沿 face-up 的垂直方向 (左脸 -X，右脸 +X) 行进，遇到 `skin ∪ all-hair` silhouette 边界停下，停下前的最后一个像素就是 `lateral_out`。`lateral_mid` 取 `lerp(MP锚点, lateral_out, 0.5)`。
-2. **椭球先验** (`fit_head_ellipsoid`)：用 468 MP 点的 XY 包围盒 + 解剖学先验 (axis_margin=1.30, depth/width=1.15, center_depth_offset=0.35) 估计一个轴对齐椭球。**不用纯算法 LSQ 拟合**，因为 468 点只覆盖头部前半层会得到 saddle 解。
-3. **3D Z 解算** (`lift_lateral_to_3d`)：对每个 lateral 2D 点 `(x, y)`，把椭球方程 `((x-cx)/a)² + ((y-cy)/b)² + ((z-cz)/c)² = 1` 当作 z 的一元二次解，选靠 `z_front_sign` 一侧的根；落到 xy-envelope 外时回退最近 MP 锚点的 Z。
-4. **拼装**：`assemble_full_v2` 把 468 + 17 + 17 + 10 + 10 = 522 个 (x, y, z) 顺序连起来。
-
-### CLI
-
-```bash
-python -m python.extract_headext path/to/photo.jpg --out data/photo_v2.json
-```
-
-输出 JSON 在 v1 schema 上增量：
-
-```json
-{
-  "version": "v2-headext",
-  "n_total": 522,
-  "layout": [
-    "mp[0..468)", "middle[468..485)", "hairline[485..502)",
-    "lateral_mid[502..512)", "lateral_out[512..522)"
-  ],
-  "points": [[x, y, z], ...],          // length 522
-  "valid_hairline":        [...],       // length 17
-  "valid_lateral":         [...],       // length 10
-  "lateral_in_envelope":   [...],       // length 20 (mid then out)
-  "ellipsoid": { "center": [...], "axes": [...], "z_front_sign": 1, "residual": 0.59 }
-}
-```
-
-可调参数：
-
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--landmark-backend` | `subprocess` | 同 v1 |
-| `--lateral-max-walk-ratio` | `0.15` | 外圈点沿 perp 方向走出的最大像素 = 图宽 × 该值 |
-| `--hairline-intermediates` | `1` | 给 `lateral_extend_dense` 用，1 → 33 点然后下采样到 17 |
-
-### 调试三联图
-
-```bash
-python -m python.visualize_headext path/to/photo.jpg --out data/v2_overlay.png
-```
-
-输出依次：silhouette + 10 条 lateral 射线 / 522 点 + 32 条 lateral ribbon wireframe / Z 着色 (红=近 蓝=远)。
-
-### Web 服务 (实时调参)
-
-`/headext` 页面专门调 v2 lateral 参数 (与 `/hairline` 共享同一个 LRU 缓存)，10 个 slider：
-
-| key | 默认 | 含义 |
-|-----|------|------|
-| `lateral_max_walk_ratio_x100` | 15 | 同 CLI |
-| `lateral_mid_t_x100` | 50 | mid 点的内插系数 (50=居中, 80=贴近 out) |
-| `use_full_silhouette` | ON | silhouette 用 `skin ∪ all-hair`；OFF 时只用面部毗邻 hair |
-| `ellipsoid_axis_margin_x100` | 130 | 椭球 (a, b) 相对 MP 包围盒的放大系数 |
-| `ellipsoid_depth_to_width_x100` | 115 | c = max(a, b) × 该值 / 100 |
-| `ellipsoid_center_depth_offset_x100` | 35 | 椭球中心相对前脸的后移系数 |
-| `ellipsoid_axes_clip_ratio_x100` | 100 | 超出 envelope 时 z 的限幅系数 |
-| `show_silhouette_panel` / `show_points_panel` / `show_depth_panel` | ON | 单独勾选要渲染的面板 |
+* **左** = 原图 + 502 识别点 (MP / v1 middle / v1 hairline 三组色编)。下方 meta 行打出 `⟨ z(hairline) − z(MP anchor) ⟩` 这个指标 —— **必须 > 0** 才说明 hairline 在 anchor 的后方 (头骨向后弯), 贴皮肤; 一旦 ≤ 0 就说明矢状-arc 模型回退到了直接抄 anchor Z 的旧 bug。
+* **右上** = ortho 正交投影 overlay。原图当底, 贴图 mesh 叠在上面 (与原图严格像素对齐), 用来确认贴图 UV 与活脸 mesh 在画面上对得上。可切贴图/线框/不透明度。
+* **右下** = `face_ext.obj` canonical 模板, 可拖动旋转。用来确认 canonical mesh 本身没有 z 翻号 / UV 错位。
 
 HTTP：
 
 | 路径 | 方法 | 说明 |
 |------|------|------|
-| `/headext` | GET | 上传页 |
-| `/headext/analyze` | POST (multipart) | 上传 + 用默认参数渲染一次 |
-| `/headext/api/render` | POST (json `{stem, params}`) | 用新参数重渲染 (仅 CPU, 100~300 ms) |
-| `/headext/outputs/<filename>` | GET | overlay PNG |
+| `/preview` | GET | 3D 验证页上传入口 |
+| `/preview/analyze` | POST (multipart) | 上传 + 算 502 点 |
+| `/preview/api/data/<stem>` | GET | 该 stem 的 502 点 (MP-order + OBJ-order) |
+| `/preview/assets/face_ext.json` | GET | OBJ 的 indexed-geometry JSON, Three.js 直接灌进 `BufferGeometry` |
+| `/preview/assets/{face_ext.obj,texture0.png}` | GET | 静态资源 |
 
-`/hairline` 页右上角有跳转链接；两个页面共享 stem，上传一次即可两边来回调。
-
-### 生成 `face_ext_v2.obj`
-
-```bash
-python -m tools.gen_face_ext_v2
-python python/check_ext_obj.py --all     # 校验 v1 + v2
-```
-
-`face_ext_v2.obj` 在 `face_ext.obj` 基础上追加 20 个 lateral 顶点 + 32 个三角面，前 502 个顶点 / UV / 法线 / 916 个三角面完全不变。
-
-### v2 UV 在贴图哪个位置
-
-为了不冲突已有贴图 (`imgs/texture0.png` 占 image y ≈ 229..460), v2 把 lateral 20 个顶点的 UV 放到当前 **未使用的图像顶部** (image y ≈ 0..115, 也就是 OBJ raw V ≈ 0.77..1.0)：
-
-| 行 | OBJ raw V | image y (512 px) | 用途 |
-|----|-----------|------------------|------|
-| `UV_LATERAL_OUT_V` | 0.92 | ≈ 41 | 外圈 10 点 |
-| `UV_LATERAL_MID_V` | 0.86 | ≈ 72 | 中间 10 点 |
-
-每条横带又分左右两段 (U=0.05..0.45 左 / U=0.55..0.95 右)，每段铺 5 个锚点。常量定义在 `python/constants.py` 的 `UV_LATERAL_*`，配套函数 `lateral_uv_for(row, side, col)`。
-
-用 `python/uv_template.py` 可以画一张当前 UV 布局图，叠到 `texture0.png` 上方便重绘贴图。
+`/hairline` 页右上角有跳转链接；两个页面共享 stem，上传一次即可来回调。
 
 ## C++ SDK 接入
 
@@ -682,8 +582,7 @@ shader 和贴图采样逻辑不需要改；新增顶点已经在 OBJ 里有 UV�
 | 参数 | 作用 | 什么时候调 |
 |------|------|------------|
 | `MP_TOP_ANCHORS` | 17 个 MediaPipe 额头上沿锚点 | 射线起点不合理、漏掉太阳穴、整体发际线偏移 |
-| `curve_offset_z(i)` | 发际线行的 Z 弧度 | 侧视时发际线太平、太凸或太陷 |
-| `bulge_z(i)` | 中间行的 Z 弧度 | 额头扩展带看起来像平面或折角明显 |
+| `HEAD_ARC_RADIUS_FRAC` | 矢状-arc 半径占脸高的比例 (默认 0.30) | hairline/middle 在 3D 里贴脸太紧或太靠后, 取值越小向头后弯曲越快 |
 | `UV_STRIP_U_MIN/MAX` | 新增区域在贴图里的横向范围 | 贴图内容横向拉伸、压缩或碰到其他图块 |
 | `UV_MIDDLE_V` | 中间行贴图 V 坐标 | 中间行采样到错误贴图位置 |
 | `UV_HAIRLINE_V` | 发际线行贴图 V 坐标 | 发际线边缘采样到错误贴图位置 |
@@ -716,5 +615,5 @@ shader 和贴图采样逻辑不需要改；新增顶点已经在 OBJ 里有 UV�
 2. 再看 `visualize.py anchors`：17 个 MediaPipe 锚点是否在额头上沿，射线方向是否正确。
 3. 如果锚点错，调 `MP_TOP_ANCHORS`。
 4. 如果分割错，换图、改善光照，或换/微调 face parsing 模型。
-5. 如果 2D 点对但 3D 形状不好，调 `curve_offset_z(i)` 和 `bulge_z(i)`。
+5. 如果 2D 点对但 3D 形状不好，调 `HEAD_ARC_RADIUS_FRAC` (越小新点越向头后弯), 或上 `/preview` 看 `⟨z(hairline) − z(MP anchor)⟩` 这个指标是否为正。
 6. 如果 mesh 对但贴图错，调 UV 常量并重新生成 `face_ext.obj`。

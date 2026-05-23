@@ -36,44 +36,30 @@ if __package__ is None or __package__ == "":
     from python.face_parsing import FaceParser
     from python.hairline_2d import (
         sample_hairline_lateral_extend_dense,
-        sample_lateral_extension,
         smooth_hairline_corner_aware,
     )
-    from python.head_ellipsoid import fit_head_ellipsoid
     from python.lift_3d import (
+        assemble_full,
         build_middle_row,
         lift_hairline_to_3d,
-        lift_lateral_to_3d,
-        assemble_full_v2,
     )
-    from python.visualize_headext import (
-        render_silhouette_panel,
-        render_points_panel,
-        render_depth_panel,
-        hstack as hstack_panels,
-    )
+    from python._index_map_data import INDEX_MAP_468
+    from python.obj_io import read_obj
 else:
     from . import constants as C
     from .face_landmarks import FaceLandmarker, SolutionsFaceLandmarker
     from .face_parsing import FaceParser
     from .hairline_2d import (
         sample_hairline_lateral_extend_dense,
-        sample_lateral_extension,
         smooth_hairline_corner_aware,
     )
-    from .head_ellipsoid import fit_head_ellipsoid
     from .lift_3d import (
+        assemble_full,
         build_middle_row,
         lift_hairline_to_3d,
-        lift_lateral_to_3d,
-        assemble_full_v2,
     )
-    from .visualize_headext import (
-        render_silhouette_panel,
-        render_points_panel,
-        render_depth_panel,
-        hstack as hstack_panels,
-    )
+    from ._index_map_data import INDEX_MAP_468
+    from .obj_io import read_obj
 
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -153,64 +139,6 @@ def _params_to_kwargs(params: dict) -> dict:
         "outer_per_side": None if params["outer_per_side"] < 0 else params["outer_per_side"],
         "density_run_length": params["density_run_length"],
     }
-
-
-# ---------------------------------------------------------------------------
-# v2-headext slider schema
-# ---------------------------------------------------------------------------
-
-HEADEXT_PARAM_SCHEMA: tuple[dict, ...] = (
-    dict(key="lateral_max_walk_ratio_x100", label="lateral 外推幅度 × 100",
-         type="int", min=2, max=30, step=1, default=15,
-         hint="lateral 锚点沿垂直 face-up 方向向外行走的最大像素 = 图宽 × N/100。"),
-    dict(key="lateral_mid_t_x100", label="mid 行内插系数 × 100",
-         type="int", min=20, max=80, step=1, default=50,
-         hint="mid_xy = lerp(MP锚点, out_xy, t)。50 = 居中, 越大越靠近 out。"),
-    dict(key="use_full_silhouette", label="silhouette = skin ∪ all-hair",
-         type="bool", default=True,
-         hint="ON: 用整个 skin+hair 作为 lateral 外缘 mask (推荐)。OFF: 只用面部毗邻的 hair。"),
-    dict(key="ellipsoid_axis_margin_x100", label="椭球半轴放大 × 100 (axis_margin)",
-         type="int", min=100, max=160, step=1, default=130,
-         hint="MP bbox 半轴 × N/100, 决定椭球 (a, b) 的大小。≥130 才能罩住 ear+hair 外缘。"),
-    dict(key="ellipsoid_depth_to_width_x100", label="头深 / 头宽比 × 100 (c/a)",
-         type="int", min=70, max=160, step=1, default=115,
-         hint="c = max(a, b) × N/100。真人头骨 ≈ 1.10~1.20。"),
-    dict(key="ellipsoid_center_depth_offset_x100", label="椭球中心后移系数 × 100",
-         type="int", min=10, max=60, step=1, default=35,
-         hint="cz = z_front - z_front_sign × c × N/100。越大椭球中心越靠后, lateral 点 Z 越浅。"),
-    dict(key="ellipsoid_axes_clip_ratio_x100", label="ellipsoid axes 限幅 × 100",
-         type="int", min=50, max=150, step=1, default=100,
-         hint="椭球解算时, |z-cz| 的上限 = N/100 × c。越小越不容易往背部跳。"),
-    dict(key="show_silhouette_panel", label="第 1 列: silhouette + 射线",
-         type="bool", default=True, hint="关闭可缩短渲染时间。"),
-    dict(key="show_points_panel", label="第 2 列: 522 点 + ribbon",
-         type="bool", default=True, hint=""),
-    dict(key="show_depth_panel", label="第 3 列: Z 深度着色",
-         type="bool", default=True, hint=""),
-)
-HEADEXT_PARAM_DEFAULTS: dict = {p["key"]: p["default"] for p in HEADEXT_PARAM_SCHEMA}
-
-
-def _normalize_headext_params(raw: dict) -> dict:
-    out = dict(HEADEXT_PARAM_DEFAULTS)
-    for schema in HEADEXT_PARAM_SCHEMA:
-        key = schema["key"]
-        if key not in raw:
-            continue
-        v = raw[key]
-        if schema["type"] == "int":
-            try:
-                v = int(v)
-            except (TypeError, ValueError):
-                continue
-            v = max(schema["min"], min(schema["max"], v))
-        elif schema["type"] == "bool":
-            if isinstance(v, str):
-                v = v.lower() in ("1", "true", "yes", "on")
-            else:
-                v = bool(v)
-        out[key] = v
-    return out
 
 
 @dataclass(frozen=True)
@@ -387,25 +315,27 @@ class HairlineWebAnalyzer:
             "elapsed_ms": elapsed,
         }
 
-    def render_headext(self, stem: str, params: dict, out_dir: str) -> dict:
-        """Run the full v2-headext pipeline with the given params + render 3 panels."""
+    def prepare_preview(self, stem: str) -> dict:
+        """Run the v1 (502-vertex) pipeline with default params and return
+        the points in both MP-order (raw output) and OBJ-vertex order
+        (slot-for-slot match with face_ext.obj), plus metadata.
+
+        The caller is expected to have already called `prepare(image_path, stem)`.
+        """
         cache = self._cache.get(stem)
         if cache is None:
             raise KeyError("缓存里没有这张图, 请重新上传。")
         if cache["landmarks"] is None:
-            raise RuntimeError("当前 backend 不返回 landmarks (parsing 模式), 无法跑 headext。")
+            raise RuntimeError("当前 backend 不返回 landmarks (parsing 模式), 无法跑 preview。")
 
         rgb = cache["rgb"]
         parse_map = cache["parse_map"]
         landmarks = cache["landmarks"]
+        h, w = rgb.shape[:2]
 
-        started = time.perf_counter()
         with self._lock:
             self._cache.move_to_end(stem)
 
-            # v1 hairline + middle (fixed defaults — they aren't tuned here;
-            # use the /hairline page for that). 17 anchor pts subsampled from
-            # the dense pipeline so the 502 stitching still works.
             hairline_dense, _ = sample_hairline_lateral_extend_dense(
                 landmarks, parse_map, intermediates=1,
             )
@@ -419,67 +349,28 @@ class HairlineWebAnalyzer:
             hairline_3d = lift_hairline_to_3d(landmarks, hairline_smoothed)
             middle_3d = build_middle_row(landmarks, hairline_3d)
 
-            # v2 lateral ribbon
-            lateral_mid_xy, lateral_out_xy, lateral_valid = sample_lateral_extension(
-                landmarks, parse_map,
-                max_walk_ratio=params["lateral_max_walk_ratio_x100"] / 100.0,
-                mid_t=params["lateral_mid_t_x100"] / 100.0,
-                use_full_silhouette=bool(params["use_full_silhouette"]),
-            )
-            ellipsoid = fit_head_ellipsoid(
-                landmarks,
-                axis_margin=params["ellipsoid_axis_margin_x100"] / 100.0,
-                depth_to_width_ratio=params["ellipsoid_depth_to_width_x100"] / 100.0,
-                center_depth_offset=params["ellipsoid_center_depth_offset_x100"] / 100.0,
-            )
-            lateral_mid_3d, lateral_out_3d, in_envelope = lift_lateral_to_3d(
-                landmarks, lateral_out_xy, lateral_mid_xy, ellipsoid,
-                axes_clip_ratio=params["ellipsoid_axes_clip_ratio_x100"] / 100.0,
-            )
+            pts_mp = assemble_full(landmarks, middle_3d, hairline_3d)
 
-            pts_522 = assemble_full_v2(
-                landmarks, middle_3d, hairline_3d, lateral_mid_3d, lateral_out_3d,
-            )
+            # Reorder to match the OBJ's vertex slots: for slots [0..468)
+            # OBJ slot i holds the MP landmark with id INDEX_MAP_468[i].
+            # Slots [468..502) are identity (face_ext.obj uses the same
+            # ordering as the JSON output).
+            pts_obj = np.zeros_like(pts_mp)
+            for obj_idx, mp_idx in enumerate(INDEX_MAP_468):
+                pts_obj[obj_idx] = pts_mp[mp_idx]
+            pts_obj[C.N_MP:] = pts_mp[C.N_MP:]
 
-            panels: list[np.ndarray] = []
-            captions: list[str] = []
-            if params["show_silhouette_panel"]:
-                panels.append(render_silhouette_panel(
-                    rgb, parse_map, landmarks,
-                    lateral_mid_xy, lateral_out_xy, lateral_valid,
-                ))
-                captions.append("silhouette + lateral rays")
-            if params["show_points_panel"]:
-                panels.append(render_points_panel(rgb, pts_522, lateral_valid))
-                captions.append("522 verts + ribbon wireframe")
-            if params["show_depth_panel"]:
-                panels.append(render_depth_panel(rgb, pts_522))
-                captions.append("Z depth coloring")
-
-            if not panels:
-                # User unchecked everything → fall back to depth so the page
-                # never goes blank.
-                panels.append(render_depth_panel(rgb, pts_522))
-                captions.append("Z depth coloring")
-
-            overlay = hstack_panels(panels)
-            overlay_filename = f"{stem}_headext_overlay.png"
-            _save_rgb(os.path.join(out_dir, overlay_filename), overlay)
-
-        elapsed = int((time.perf_counter() - started) * 1000)
         return {
-            "overlay_filename": overlay_filename,
-            "panel_count": len(panels),
-            "captions": captions,
-            "lateral_valid": int(lateral_valid.sum()),
-            "lateral_in_envelope": int(in_envelope.sum()),
-            "ellipsoid": {
-                "center": [ellipsoid.cx, ellipsoid.cy, ellipsoid.cz],
-                "axes": [ellipsoid.a, ellipsoid.b, ellipsoid.c],
-                "z_front_sign": int(ellipsoid.z_front_sign),
-                "residual": float(ellipsoid.mean_residual),
+            "image": {"width": int(w), "height": int(h)},
+            "n_total": int(pts_mp.shape[0]),
+            "points_mp_order": pts_mp.astype(float).tolist(),
+            "points_obj_order": pts_obj.astype(float).tolist(),
+            "valid_hairline": valid_17.tolist(),
+            "groups": {
+                "mp": [0, C.N_MP],
+                "v1_middle": [C.MIDDLE_START, C.HAIRLINE_START],
+                "v1_hairline": [C.HAIRLINE_START, C.N_TOTAL],
             },
-            "elapsed_ms": elapsed,
         }
 
 
@@ -661,7 +552,9 @@ INDEX_HTML = """
 <body>
   <main class="page">
     <section class="hero">
-      <div style="float:right;font-size:13px;"><a href="/headext" style="color:#2563eb;text-decoration:none;">→ 切到 /headext 调头部扩展 mesh (522 顶点)</a></div>
+      <div style="float:right;font-size:13px;">
+        <a href="/preview" style="color:#2563eb;text-decoration:none;margin-left:8px;">/preview (3D 验证)</a>
+      </div>
       <h1>发际线分析 · lateral_extend_dense 实时调参</h1>
       <p class="muted">上传一张正脸照片后, 在左侧滑块上调整任何参数都会立即重新渲染发际线 (parse map + landmarks 只在上传时跑一次)。</p>
       <form action="/hairline/analyze" method="post" enctype="multipart/form-data">
@@ -859,205 +752,451 @@ INDEX_HTML = """
 """
 
 
-HEADEXT_HTML = """
+PREVIEW_HTML = """
 <!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>头部扩展 3D mesh · v2-headext 实时调参</title>
+  <title>v1 端到端验证 · 502 点 + face_ext + texture0</title>
   <style>
     :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f7fb; color: #1f2937; }
     body { margin: 0; }
-    .page { max-width: 1480px; margin: 0 auto; padding: 28px 20px 48px; }
-    .hero, .card { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 16px; padding: 22px; box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05); }
-    h1 { margin: 0 0 10px; font-size: 26px; }
+    .page { max-width: 1480px; margin: 0 auto; padding: 24px 18px 40px; }
+    .hero, .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 20px; box-shadow: 0 8px 22px rgba(15, 23, 42, 0.05); }
+    h1 { margin: 0 0 10px; font-size: 24px; }
     p { line-height: 1.6; margin: 0 0 8px; }
-    .muted { color: #6b7280; font-size: 14px; }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-family: ui-monospace, monospace; margin-right: 6px; }
-    .pill.v1 { background: #fef3c7; color: #92400e; }
-    .pill.v2 { background: #dbeafe; color: #1e3a8a; }
-    form { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 16px; }
+    .muted { color: #6b7280; font-size: 13px; }
+    form { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-top: 14px; }
     input[type=file] { flex: 1 1 320px; border: 1px dashed #9ca3af; border-radius: 10px; background: #f9fafb; padding: 12px; }
     button.primary { border: 0; border-radius: 10px; background: #2563eb; color: white; font-weight: 700; padding: 12px 20px; cursor: pointer; }
     button.primary:hover { background: #1d4ed8; }
-    .error { margin-top: 16px; padding: 12px 14px; border-radius: 10px; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; white-space: pre-wrap; }
-    .layout { margin-top: 22px; display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 18px; }
-    @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
-    .controls .control { margin-bottom: 14px; padding-bottom: 10px; border-bottom: 1px dashed #e5e7eb; }
-    .controls .control:last-child { border-bottom: 0; margin-bottom: 0; padding-bottom: 0; }
-    .controls label { display: block; font-weight: 600; font-size: 13px; margin-bottom: 6px; }
-    .controls .row { display: flex; align-items: center; gap: 8px; }
-    .controls input[type=range] { flex: 1; }
-    .controls .val { min-width: 42px; text-align: right; font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; color: #1d4ed8; font-weight: 700; }
-    .controls .hint { display: block; font-size: 11px; color: #6b7280; margin-top: 6px; line-height: 1.4; }
-    .meta { margin: 8px 0 14px; padding: 10px 12px; border-radius: 10px; background: #eff6ff; color: #1e3a8a; border: 1px solid #bfdbfe; font-size: 13px; font-family: ui-monospace, monospace; line-height: 1.6; word-break: break-all; }
-    figure { margin: 0; }
-    figure img { width: 100%; height: auto; border-radius: 12px; background: #111827; display: block; }
-    figcaption { margin-top: 6px; font-size: 12px; color: #6b7280; text-align: center; }
-    .reset { background: transparent; color: #6b7280; border: 1px solid #d1d5db; border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer; margin-top: 6px; }
-    .reset:hover { color: #1f2937; border-color: #6b7280; }
-    .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; background: #e0e7ff; color: #1e3a8a; font-size: 12px; margin-left: 4px; font-family: ui-monospace, monospace; }
-    .status { font-size: 12px; color: #6b7280; margin-left: 8px; }
-    .status.busy { color: #b45309; } .status.err { color: #991b1b; }
-    .original-strip { margin-top: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    .original-strip img { max-height: 96px; border-radius: 8px; background: #111827; }
-    .original-strip small { color: #6b7280; }
+    .error { margin-top: 14px; padding: 12px 14px; border-radius: 10px; background: #fef2f2; color: #991b1b; border: 1px solid #fecaca; white-space: pre-wrap; }
+    .layout { margin-top: 20px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr); gap: 18px; }
+    @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
+    .panel-title { font-size: 14px; font-weight: 700; color: #374151; margin: 0 0 8px; display: flex; align-items: center; gap: 8px; }
+    .panel-title small { color: #6b7280; font-weight: 500; font-size: 12px; }
+    .img-wrap { position: relative; width: 100%; }
+    .img-wrap img { display: block; width: 100%; height: auto; border-radius: 10px; background: #111827; }
+    .img-wrap canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+    .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; font-size: 12px; color: #374151; }
+    .legend .item { display: flex; align-items: center; gap: 6px; }
+    .legend .swatch { width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.15); }
+    .threejs-grid { display: grid; grid-template-rows: 1fr 1fr; gap: 14px; }
+    .three-card { background: #0f172a; border-radius: 12px; overflow: hidden; position: relative; min-height: 360px; aspect-ratio: 16 / 11; }
+    .three-card .three-canvas { display: block; width: 100%; height: 100%; }
+    .three-card.overlay-card { background: #000; aspect-ratio: auto; min-height: 0; }
+    .three-card.overlay-card .overlay-bg { display: block; width: 100%; height: auto; }
+    .three-card.overlay-card .overlay-canvas {
+      position: absolute; left: 0; top: 0; width: 100%; height: 100%;
+      pointer-events: none;
+    }
+    .three-card .badge {
+      position: absolute; top: 10px; left: 10px; padding: 4px 10px;
+      border-radius: 999px; background: rgba(255, 255, 255, 0.92);
+      color: #1f2937; font-size: 12px; font-weight: 700;
+      box-shadow: 0 2px 6px rgba(0,0,0,0.3); z-index: 2;
+    }
+    .three-card .controls-help {
+      position: absolute; bottom: 10px; right: 10px; padding: 4px 9px;
+      background: rgba(15, 23, 42, 0.7); color: #e5e7eb; font-size: 11px;
+      border-radius: 6px; pointer-events: none;
+    }
+    .three-card .toggle-row {
+      position: absolute; bottom: 10px; left: 10px;
+      background: rgba(15, 23, 42, 0.7); color: #e5e7eb; font-size: 11px;
+      border-radius: 6px; padding: 4px 8px; display: flex; gap: 8px; align-items: center;
+    }
+    .three-card .toggle-row label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+    .three-card .toggle-row input { accent-color: #60a5fa; }
+    .meta { margin: 10px 0 4px; padding: 8px 10px; border-radius: 8px; background: #eff6ff; color: #1e3a8a; border: 1px solid #bfdbfe; font-size: 12px; font-family: ui-monospace, monospace; word-break: break-all; }
     .nav-links { float: right; font-size: 13px; }
     .nav-links a { color: #2563eb; text-decoration: none; margin-left: 8px; }
     .nav-links a:hover { text-decoration: underline; }
+    .status { font-size: 12px; color: #6b7280; margin-left: 8px; }
+    .status.busy { color: #b45309; } .status.err { color: #991b1b; }
   </style>
 </head>
 <body>
   <main class="page">
     <section class="hero">
-      <div class="nav-links"><a href="/hairline">→ 切到 /hairline 调发际线</a></div>
-      <h1>头部扩展 mesh · v2-headext 实时调参 <span class="badge">522 顶点</span></h1>
-      <p class="muted">在 MP 468 + 17 middle + 17 hairline 之上, 额外添加 <span class="pill v2">lateral_mid × 10</span> + <span class="pill v2">lateral_out × 10</span>, 覆盖太阳穴 → 颧弓 → 耳前的外圈, 让贴图能延伸到额头与脸颊侧面。</p>
-      <form action="/headext/analyze" method="post" enctype="multipart/form-data">
+      <div class="nav-links">
+        <a href="/hairline">/hairline</a>
+      </div>
+      <h1>v1 hairline mesh · 端到端 3D 验证 <span class="status" id="hero_status"></span></h1>
+      <p class="muted">上传一张正脸照, 左侧画 3 组识别点 (MP 468 + v1 middle 17 + v1 hairline 17 = 502), 右上是 ortho 正交投影 = 原图为底 + 活脸 mesh 贴图 overlay (与原图严格对齐), 右下是 OBJ 文件里的标准模板 mesh (可旋转). 新加的 middle / hairline 行 z 用矢状-arc 公式 z = z_anchor + dy²/(2R) 反解, 始终向头后方向偏, 严格落在头骨曲面上.</p>
+      <form action="/preview/analyze" method="post" enctype="multipart/form-data">
         <input type="file" name="image" accept="image/png,image/jpeg,image/webp" required>
         <button class="primary" type="submit">上传 / 开始分析</button>
       </form>
       {% if error %}<div class="error">{{ error }}</div>{% endif %}
-      {% if init %}
-      <div class="original-strip">
-        <img src="{{ init.original_url }}" alt="上传的原图">
-        <small>文件 <b>{{ init.original_name }}</b> · backend <b>{{ init.backend }}</b> · parse+landmark 用时 {{ init.prepare_ms }} ms · stem <code>{{ init.stem }}</code></small>
-      </div>
-      {% endif %}
     </section>
 
     {% if init %}
     <section class="layout">
-      <aside class="card controls">
-        <h2 style="margin:0 0 12px; font-size:16px;">参数调节
-          <span class="badge">v2-headext</span>
-          <span class="status" id="status">--</span>
-        </h2>
-        <div id="ctrl_root"></div>
-        <button class="reset" id="reset_btn" type="button">↺ 重置全部参数</button>
-      </aside>
       <article class="card">
+        <h2 class="panel-title">原图 + 502 识别点 <small>3 组色编</small></h2>
+        <div class="img-wrap">
+          <img id="orig_img" src="{{ init.original_url }}" alt="原图">
+          <canvas id="overlay_canvas"></canvas>
+        </div>
+        <div class="legend">
+          <div class="item"><span class="swatch" style="background:#cccccc"></span> MediaPipe 468</div>
+          <div class="item"><span class="swatch" style="background:#ffa040"></span> v1 middle 17</div>
+          <div class="item"><span class="swatch" style="background:#ffc864"></span> v1 hairline 17</div>
+        </div>
         <div class="meta" id="meta">--</div>
-        <figure>
-          <img id="img_overlay" src="" alt="v2-headext 三联可视化">
-          <figcaption>silhouette + 522 点 + Z 着色</figcaption>
-        </figure>
+      </article>
+
+      <article class="card">
+        <h2 class="panel-title">3D 渲染对比 <small>OBJ + texture0.png</small></h2>
+        <div class="threejs-grid">
+          <div class="three-card overlay-card" id="card_live">
+            <span class="badge">活脸 overlay · 原图 + 贴图 mesh</span>
+            <img class="overlay-bg" id="overlay_bg" src="{{ init.original_url }}" alt="overlay bg">
+            <canvas class="three-canvas overlay-canvas" id="canvas_live"></canvas>
+            <div class="toggle-row">
+              <label><input type="checkbox" id="wf_live"> 线框</label>
+              <label><input type="checkbox" id="tex_live" checked> 贴图</label>
+              <label>不透明度 <input type="range" id="alpha_live" min="0" max="100" value="100" style="width:80px"></label>
+            </div>
+            <span class="controls-help">静态 ortho · 与原图严格对齐</span>
+          </div>
+          <div class="three-card" id="card_canonical">
+            <span class="badge">canonical · face_ext.obj (可旋转)</span>
+            <canvas class="three-canvas" id="canvas_canonical"></canvas>
+            <div class="toggle-row">
+              <label><input type="checkbox" id="wf_canonical"> 线框</label>
+              <label><input type="checkbox" id="tex_canonical" checked> 贴图</label>
+            </div>
+            <span class="controls-help">drag · wheel · right-drag</span>
+          </div>
+        </div>
       </article>
     </section>
 
-    <script>
-    (function () {
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+    </script>
+    <script type="module">
+      import * as THREE from 'three';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
       const STEM = {{ init.stem|tojson }};
-      const SCHEMA = {{ init.param_schema|tojson }};
-      const INIT_PARAMS = {{ init.initial_params|tojson }};
-      const INIT_RESULT = {{ init.initial_render|tojson }};
+      const heroStatus = document.getElementById('hero_status');
 
-      const $ = id => document.getElementById(id);
-      const root = $("ctrl_root");
-      const status = $("status");
-
-      function makeControl(s, value) {
-        const wrap = document.createElement("div"); wrap.className = "control";
-        const label = document.createElement("label"); label.htmlFor = "p_" + s.key; label.textContent = s.label;
-        wrap.appendChild(label);
-        const row = document.createElement("div"); row.className = "row";
-        let input;
-        if (s.type === "bool") {
-          input = document.createElement("input");
-          input.type = "checkbox"; input.id = "p_" + s.key; input.checked = !!value;
-        } else {
-          input = document.createElement("input");
-          input.type = "range"; input.id = "p_" + s.key;
-          input.min = s.min; input.max = s.max; input.step = s.step; input.value = value;
-        }
-        row.appendChild(input);
-        const valSpan = document.createElement("span"); valSpan.className = "val";
-        valSpan.id = "p_" + s.key + "_val";
-        valSpan.textContent = (s.type === "bool") ? (value ? "ON" : "OFF") : String(value);
-        row.appendChild(valSpan); wrap.appendChild(row);
-        if (s.hint) { const h = document.createElement("span"); h.className = "hint"; h.textContent = s.hint; wrap.appendChild(h); }
-        return { wrap, input, valSpan };
+      function setStatus(text, cls) {
+        heroStatus.textContent = text;
+        heroStatus.className = 'status' + (cls ? ' ' + cls : '');
       }
 
-      const inputs = {};
-      SCHEMA.forEach(s => {
-        const { wrap, input, valSpan } = makeControl(s, INIT_PARAMS[s.key]);
-        root.appendChild(wrap);
-        inputs[s.key] = { input, valSpan, schema: s };
-      });
+      // --- Fetch detected points -----------------------------------------
+      let dataPromise = (async () => {
+        setStatus('载入识别点 …', 'busy');
+        const r = await fetch('/preview/api/data/' + STEM);
+        if (!r.ok) throw new Error('GET /preview/api/data failed: ' + r.status);
+        const j = await r.json();
+        return j;
+      })();
 
-      function readParams() {
-        const out = {};
-        for (const [k, { input, schema }] of Object.entries(inputs)) {
-          if (schema.type === "bool") out[k] = input.checked;
-          else out[k] = parseInt(input.value, 10);
-        }
-        return out;
-      }
+      // --- Left: original image + 502 colored dots overlay ---------------
+      async function drawOverlay() {
+        const data = await dataPromise;
+        const img = document.getElementById('orig_img');
+        const canvas = document.getElementById('overlay_canvas');
+        const meta = document.getElementById('meta');
 
-      function applyResult(j) {
-        const t = Date.now();
-        $("img_overlay").src = "/headext/outputs/" + j.overlay_filename + "?t=" + t;
-        const ell = j.ellipsoid;
-        $("meta").innerHTML =
-          "渲染 " + j.elapsed_ms + " ms · 面板 " + j.panel_count +
-          " · lateral_valid " + j.lateral_valid + "/10" +
-          " · lateral_in_envelope " + j.lateral_in_envelope + "/20<br>" +
-          "ellipsoid center (" + ell.center.map(x => x.toFixed(3)).join(", ") +
-          ") · axes (" + ell.axes.map(x => x.toFixed(3)).join(", ") +
-          ") · z_front_sign " + (ell.z_front_sign > 0 ? "+1" : "-1") +
-          " · residual " + ell.residual.toFixed(4);
-      }
-
-      let renderSeq = 0; let pendingTimer = null;
-      async function render() {
-        const seq = ++renderSeq;
-        status.textContent = "渲染中…"; status.className = "status busy";
-        try {
-          const r = await fetch("/headext/api/render", {
-            method: "POST", headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ stem: STEM, params: readParams() })
-          });
-          if (!r.ok) {
-            const t = await r.text();
-            if (seq === renderSeq) { status.textContent = "错误: " + t; status.className = "status err"; }
-            return;
+        async function draw() {
+          const W = img.naturalWidth, H = img.naturalHeight;
+          canvas.width = W; canvas.height = H;
+          const ctx = canvas.getContext('2d');
+          ctx.clearRect(0, 0, W, H);
+          const groups = data.groups;
+          const colors = {
+            mp: '#cccccc', v1_middle: '#ffa040', v1_hairline: '#ffc864',
+          };
+          const radii = { mp: 1.6, v1_middle: 3.2, v1_hairline: 3.2 };
+          const pts = data.points_mp_order;
+          for (const [name, [a, b]] of Object.entries(groups)) {
+            const c = colors[name];
+            if (!c) continue;
+            ctx.fillStyle = c;
+            const r = (radii[name] || 2) * (Math.min(W, H) / 600.0);
+            for (let i = a; i < b; i++) {
+              const p = pts[i];
+              const x = p[0] * W, y = p[1] * H;
+              ctx.beginPath();
+              ctx.arc(x, y, r, 0, 2 * Math.PI);
+              ctx.fill();
+            }
           }
-          const j = await r.json();
-          if (seq !== renderSeq) return;
-          applyResult(j);
-          status.textContent = "✓ 已更新"; status.className = "status";
-        } catch (e) {
-          if (seq === renderSeq) { status.textContent = "错误: " + e; status.className = "status err"; }
+          // Z stats so we can verify added points have z >= their MP anchor
+          // (sagittal-arc model). hairline 中央 z 应 > MP 10 (额头) z.
+          const ANCHORS = [127,234,162,21,54,103,67,109,10,338,297,332,284,251,389,356,454];
+          const HAIR_START = 485;
+          let anchor_z_sum = 0, hair_z_sum = 0;
+          for (let i = 0; i < 17; i++) {
+            anchor_z_sum += pts[ANCHORS[i]][2];
+            hair_z_sum += pts[HAIR_START + i][2];
+          }
+          const dz_mean = (hair_z_sum - anchor_z_sum) / 17;
+          meta.innerHTML =
+            '图片 ' + W + 'x' + H + ' · 502 点 (468 MP + 17 mid + 17 hair)<br>' +
+            'valid_hairline ' + data.valid_hairline.filter(Boolean).length + '/17 · ' +
+            '⟨ z(hairline) − z(MP anchor) ⟩ = ' + dz_mean.toFixed(4) +
+            (dz_mean > 0 ? ' ✓ (向头后弯, 贴皮肤)' : ' ✗ (浮在脸前!)');
         }
+        if (img.complete && img.naturalWidth > 0) await draw();
+        else img.addEventListener('load', draw, { once: true });
       }
-      function scheduleRender() {
-        if (pendingTimer) clearTimeout(pendingTimer);
-        pendingTimer = setTimeout(() => { pendingTimer = null; render(); }, 250);
-      }
+      drawOverlay().catch(e => setStatus('左侧渲染失败: ' + e, 'err'));
 
-      Object.entries(inputs).forEach(([k, { input, valSpan, schema }]) => {
-        const refresh = () => {
-          valSpan.textContent = (schema.type === "bool") ? (input.checked ? "ON" : "OFF") : input.value;
-          scheduleRender();
-        };
-        input.addEventListener("input", refresh);
-        input.addEventListener("change", refresh);
-      });
+      // --- Right: TOP = ortho overlay on photo, BOTTOM = 3D canonical ----
+      // Geometry source: we ship an indexed JSON instead of using OBJLoader
+      // because OBJLoader expands every face into 3 unique vertices,
+      // breaking the OBJ-vertex ↔ detected-point mapping. The JSON
+      // deduplicates by (pos_idx, uv_idx, normal_idx) triple and ships a
+      // parallel `buffer_to_obj_v` array so we can override positions
+      // per-OBJ-vertex.
+      //
+      // UV convention: uv_template.py maps img_y = (1 - V_raw) × size, so
+      // V_raw=1 corresponds to the TOP of the texture image. Three.js
+      // with default texture.flipY=true samples V=1 = top of image, so no
+      // UV flip is needed.
+      //
+      // Axis convention: face.obj uses Y growing DOWN and +Z = back of
+      // head (nose tip z≈-0.15, ear-pre z≈+0.28).
+      //
+      //   - Bottom (canonical) viewer uses a perspective camera with
+      //     Y up + camera-looks-down -Z; mesh.scale=(1,-1,-1) flips Y
+      //     and Z and preserves winding (two negatives = det +1).
+      //
+      //   - Top (live) viewer uses an orthographic frustum with top=0,
+      //     bottom=1 (i.e. y-down image coords). Camera at +Z looks down
+      //     -Z so face.obj +Z (back of head) lands behind front of face
+      //     for depth ordering. No mesh scale is applied; we keep the
+      //     image-normalized x/y exactly so the overlay registers with
+      //     the original photo pixel-for-pixel. Material uses DoubleSide
+      //     because the y-inverted ortho flips triangle winding.
+      const geomJsonURL = '/preview/assets/face_ext.json';
+      const texURL = '/preview/assets/texture0.png';
 
-      $("reset_btn").addEventListener("click", () => {
-        SCHEMA.forEach(s => {
-          const { input, valSpan } = inputs[s.key];
-          if (s.type === "bool") { input.checked = !!s.default; valSpan.textContent = input.checked ? "ON" : "OFF"; }
-          else { input.value = s.default; valSpan.textContent = String(s.default); }
+      function buildBaseMaterial(texture) {
+        return new THREE.MeshBasicMaterial({
+          map: texture,
+          side: THREE.DoubleSide,
+          color: 0xffffff,
         });
-        scheduleRender();
-      });
+      }
 
-      applyResult(INIT_RESULT);
-      status.textContent = "✓ 初始渲染"; status.className = "status";
-    })();
+      async function loadIndexedGeometry() {
+        const j = await fetch(geomJsonURL).then(r => {
+          if (!r.ok) throw new Error('GET ' + geomJsonURL + ' → ' + r.status);
+          return r.json();
+        });
+        const geom = new THREE.BufferGeometry();
+        geom.setAttribute('position', new THREE.Float32BufferAttribute(j.positions, 3));
+        geom.setAttribute('uv', new THREE.Float32BufferAttribute(j.uvs, 2));
+        geom.setAttribute('normal', new THREE.Float32BufferAttribute(j.normals, 3));
+        geom.setIndex(j.indices);
+        return { geom, bufferToObj: j.buffer_to_obj_v, nObjVertices: j.n_obj_vertices };
+      }
+
+      function applyDetectedPositions(geometry, bufferToObj, points_obj_order) {
+        // points_obj_order: length n_obj_vertices, each [x, y, z] in face.obj
+        // local space (same axes as face.obj canonical positions).
+        const pos = geometry.attributes.position;
+        if (pos.count !== bufferToObj.length) {
+          throw new Error('bufferToObj/position length mismatch: ' +
+            pos.count + ' vs ' + bufferToObj.length);
+        }
+        for (let i = 0; i < pos.count; i++) {
+          const objIdx = bufferToObj[i];
+          const p = points_obj_order[objIdx];
+          if (!p) continue;
+          pos.setXYZ(i, p[0], p[1], p[2]);
+        }
+        pos.needsUpdate = true;
+        geometry.computeVertexNormals();
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
+      }
+
+      function setupScene(canvasEl) {
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0f172a);
+
+        // Soft ambient so the unlit MeshBasicMaterial isn't needed but
+        // helpful if we toggle to MeshStandard later.
+        scene.add(new THREE.AmbientLight(0xffffff, 0.9));
+        const dir = new THREE.DirectionalLight(0xffffff, 0.4);
+        dir.position.set(1, 1, 2);
+        scene.add(dir);
+
+        const camera = new THREE.PerspectiveCamera(35, 1, 0.01, 100);
+        camera.position.set(0, 0, 1.6);
+
+        const renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true, alpha: false });
+        renderer.setPixelRatio(window.devicePixelRatio || 1);
+
+        const controls = new OrbitControls(camera, canvasEl);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.08;
+        controls.rotateSpeed = 0.9;
+        controls.zoomSpeed = 0.9;
+        controls.target.set(0.5, 0.55, 0.0);
+
+        function resize() {
+          const r = canvasEl.getBoundingClientRect();
+          renderer.setSize(r.width, r.height, false);
+          camera.aspect = Math.max(1e-3, r.width / Math.max(1e-3, r.height));
+          camera.updateProjectionMatrix();
+        }
+        resize();
+        const ro = new ResizeObserver(resize);
+        ro.observe(canvasEl);
+
+        function loop() {
+          controls.update();
+          renderer.render(scene, camera);
+          requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+        return { scene, camera, controls, renderer };
+      }
+
+      function centerAndFit(mesh, camera, controls) {
+        const box = new THREE.Box3().setFromObject(mesh);
+        const center = box.getCenter(new THREE.Vector3());
+        const size = box.getSize(new THREE.Vector3());
+        const radius = Math.max(size.x, size.y, size.z) * 0.6;
+        controls.target.copy(center);
+        const dir = new THREE.Vector3(0, 0, 1).normalize();
+        camera.position.copy(center).addScaledVector(dir, radius / Math.tan((camera.fov * Math.PI / 180) / 2) * 1.15);
+        camera.near = radius * 0.01;
+        camera.far  = radius * 100.0;
+        camera.updateProjectionMatrix();
+        controls.update();
+      }
+
+      async function setupCanonicalViewer(canvasId) {
+        const canvasEl = document.getElementById(canvasId);
+        const { scene, camera, controls, renderer } = setupScene(canvasEl);
+
+        const { geom, bufferToObj, nObjVertices } = await loadIndexedGeometry();
+        const tex = await new Promise((resolve, reject) => {
+          new THREE.TextureLoader().load(texURL, resolve, undefined, reject);
+        });
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.flipY = true;
+        tex.needsUpdate = true;
+
+        const matTex = buildBaseMaterial(tex);
+        const matWire = new THREE.MeshBasicMaterial({
+          color: 0x55ff88, wireframe: true, transparent: true, opacity: 0.6,
+        });
+
+        const mesh = new THREE.Mesh(geom, matTex);
+        mesh.scale.set(1, -1, -1);
+
+        const wire = new THREE.Mesh(geom, matWire);
+        wire.scale.copy(mesh.scale);
+        wire.visible = false;
+        scene.add(mesh);
+        scene.add(wire);
+
+        document.getElementById('wf_canonical').addEventListener('change', e => { wire.visible = e.target.checked; });
+        document.getElementById('tex_canonical').addEventListener('change', e => {
+          mesh.visible = e.target.checked;
+          if (!e.target.checked) wire.visible = true;
+        });
+
+        centerAndFit(mesh, camera, controls);
+      }
+
+      async function setupLiveOverlay(canvasId, bgImgId) {
+        const canvasEl = document.getElementById(canvasId);
+        const bgImg = document.getElementById(bgImgId);
+        const data = await dataPromise;
+
+        const scene = new THREE.Scene();  // no background → canvas stays transparent
+
+        // y-down image coords: top=0, bottom=1, so world y=0 lands at the
+        // TOP of the screen. Camera at +Z looking -Z so face.obj +Z (back
+        // of head) ends up FURTHER from the camera = behind the front.
+        const camera = new THREE.OrthographicCamera(0, 1, 0, 1, -10, 10);
+        camera.position.set(0, 0, 1);
+        camera.lookAt(0, 0, 0);
+
+        const renderer = new THREE.WebGLRenderer({
+          canvas: canvasEl, antialias: true, alpha: true, premultipliedAlpha: true,
+        });
+        renderer.setPixelRatio(window.devicePixelRatio || 1);
+        renderer.setClearColor(0x000000, 0);
+
+        const { geom, bufferToObj, nObjVertices } = await loadIndexedGeometry();
+        const tex = await new Promise((resolve, reject) => {
+          new THREE.TextureLoader().load(texURL, resolve, undefined, reject);
+        });
+        tex.colorSpace = THREE.SRGBColorSpace;
+        tex.flipY = true;
+        tex.needsUpdate = true;
+
+        const have = data.points_obj_order ? data.points_obj_order.length : 0;
+        if (have !== nObjVertices) {
+          console.warn('detected points length ' + have +
+            ' != OBJ vertex count ' + nObjVertices + ', rendering overlap only.');
+        }
+        applyDetectedPositions(geom, bufferToObj, data.points_obj_order);
+
+        const matTex = new THREE.MeshBasicMaterial({
+          map: tex, side: THREE.DoubleSide, color: 0xffffff,
+          transparent: true, opacity: 1.0,
+        });
+        const matWire = new THREE.MeshBasicMaterial({
+          color: 0x55ff88, wireframe: true, transparent: true, opacity: 0.7,
+          depthTest: false,
+        });
+
+        const mesh = new THREE.Mesh(geom, matTex);
+        const wire = new THREE.Mesh(geom, matWire);
+        wire.visible = false;
+        scene.add(mesh);
+        scene.add(wire);
+
+        document.getElementById('wf_live').addEventListener('change', e => { wire.visible = e.target.checked; });
+        document.getElementById('tex_live').addEventListener('change', e => { mesh.visible = e.target.checked; });
+        document.getElementById('alpha_live').addEventListener('input', e => {
+          matTex.opacity = parseInt(e.target.value, 10) / 100;
+        });
+
+        function resize() {
+          const r = bgImg.getBoundingClientRect();
+          if (r.width < 1 || r.height < 1) return;
+          renderer.setSize(r.width, r.height, false);
+        }
+        if (bgImg.complete && bgImg.naturalWidth > 0) resize();
+        else bgImg.addEventListener('load', resize, { once: true });
+        const ro = new ResizeObserver(resize);
+        ro.observe(bgImg);
+
+        function loop() {
+          renderer.render(scene, camera);
+          requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+      }
+
+      Promise.all([
+        setupLiveOverlay('canvas_live', 'overlay_bg'),
+        setupCanonicalViewer('canvas_canonical'),
+      ]).then(() => setStatus('✓ 已加载', null))
+        .catch(e => { console.error(e); setStatus('3D 加载失败: ' + e.message, 'err'); });
     </script>
     {% endif %}
   </main>
@@ -1152,19 +1291,30 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
     def hairline_outputs(filename: str):
         return send_from_directory(WEB_DATA_DIR, filename)
 
-    # ----- v2-headext routes ------------------------------------------------
-    @app.get("/headext")
-    def headext_index():
-        return render_template_string(HEADEXT_HTML, init=None, error=None)
+    # ----- /preview: end-to-end 3D verification -----------------------------
+    # Caches per-stem the most recent /preview/api/data payload so the page
+    # reload + 3D viewer fetch don't double-cost the v2 pipeline.
+    preview_data_cache: "collections.OrderedDict[str, dict]" = collections.OrderedDict()
 
-    @app.post("/headext/analyze")
-    def headext_analyze():
+    def _store_preview_data(stem: str, data: dict) -> None:
+        if stem in preview_data_cache:
+            preview_data_cache.move_to_end(stem)
+        preview_data_cache[stem] = data
+        while len(preview_data_cache) > CACHE_MAX_ENTRIES:
+            preview_data_cache.popitem(last=False)
+
+    @app.get("/preview")
+    def preview_index():
+        return render_template_string(PREVIEW_HTML, init=None, error=None)
+
+    @app.post("/preview/analyze")
+    def preview_analyze():
         upload = request.files.get("image")
         if upload is None or upload.filename == "":
-            return render_template_string(HEADEXT_HTML, init=None, error="请选择一张图片。"), 400
+            return render_template_string(PREVIEW_HTML, init=None, error="请选择一张图片。"), 400
         if not allowed_file(upload.filename):
             return render_template_string(
-                HEADEXT_HTML, init=None, error="只支持 jpg、jpeg、png、webp 图片。",
+                PREVIEW_HTML, init=None, error="只支持 jpg、jpeg、png、webp 图片。",
             ), 400
 
         safe_name = secure_filename(upload.filename)
@@ -1177,44 +1327,108 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
         started = time.perf_counter()
         try:
             analyzer.prepare(original_path, stem)
-            initial_render = analyzer.render_headext(stem, dict(HEADEXT_PARAM_DEFAULTS), WEB_DATA_DIR)
+            data = analyzer.prepare_preview(stem)
         except Exception as exc:
-            return render_template_string(HEADEXT_HTML, init=None, error=str(exc)), 500
+            return render_template_string(PREVIEW_HTML, init=None, error=str(exc)), 500
         prepare_ms = int((time.perf_counter() - started) * 1000)
+        _store_preview_data(stem, data)
 
         init = AnalysisInit(
             original_name=safe_name,
-            original_url=f"/headext/outputs/{original_filename}",
+            original_url=f"/preview/outputs/{original_filename}",
             stem=stem,
             backend=analyzer.landmark_backend,
             prepare_ms=prepare_ms,
-            initial_render=initial_render,
-            initial_params=dict(HEADEXT_PARAM_DEFAULTS),
-            param_schema=HEADEXT_PARAM_SCHEMA,
+            initial_render={},
+            initial_params={},
+            param_schema=(),
         )
-        return render_template_string(HEADEXT_HTML, init=init, error=None)
+        return render_template_string(PREVIEW_HTML, init=init, error=None)
 
-    @app.post("/headext/api/render")
-    def headext_api_render():
-        payload = request.get_json(silent=True) or {}
-        stem = payload.get("stem")
-        if not isinstance(stem, str) or not stem:
-            return ("missing stem", 400)
-        raw_params = payload.get("params") or {}
-        if not isinstance(raw_params, dict):
-            return ("params must be an object", 400)
-        params = _normalize_headext_params(raw_params)
+    @app.get("/preview/api/data/<stem>")
+    def preview_api_data(stem: str):
+        data = preview_data_cache.get(stem)
+        if data is not None:
+            preview_data_cache.move_to_end(stem)
+            return jsonify(data)
+        # Cache miss (e.g. process restart). Try to re-derive from the
+        # analyzer cache if the original (rgb, parse_map, landmarks) is
+        # still there.
         try:
-            result = analyzer.render_headext(stem, params, WEB_DATA_DIR)
+            data = analyzer.prepare_preview(stem)
         except KeyError as exc:
             return (str(exc), 410)
         except Exception as exc:
             return (str(exc), 500)
-        return jsonify(result)
+        _store_preview_data(stem, data)
+        return jsonify(data)
 
-    @app.get("/headext/outputs/<path:filename>")
-    def headext_outputs(filename: str):
+    @app.get("/preview/outputs/<path:filename>")
+    def preview_outputs(filename: str):
         return send_from_directory(WEB_DATA_DIR, filename)
+
+    @app.get("/preview/assets/face_ext.obj")
+    def preview_asset_obj():
+        return send_from_directory(PROJECT_DIR, "face_ext.obj", mimetype="text/plain")
+
+    @app.get("/preview/assets/face_ext.json")
+    def preview_asset_obj_json():
+        """Indexed-geometry JSON, ready to drop into Three.js BufferGeometry.
+
+        OBJLoader expands faces into 3 × num_faces non-indexed vertices,
+        which loses the OBJ-vertex-to-buffer-vertex mapping that we need
+        to override positions per OBJ vertex. This endpoint deduplicates
+        by the (pos_idx, uv_idx, normal_idx) triple so the client can
+        build an indexed BufferGeometry and keep a parallel
+        ``buffer_to_obj_v`` mapping for live-position updates.
+        """
+        cache = getattr(preview_asset_obj_json, "_cache", None)
+        if cache is None:
+            mesh = read_obj(os.path.join(PROJECT_DIR, "face_ext.obj"))
+            triple_to_buf: dict[tuple[int, int, int], int] = {}
+            positions: list[float] = []
+            uvs: list[float] = []
+            normals: list[float] = []
+            buffer_to_obj_v: list[int] = []
+            indices: list[int] = []
+            for face in mesh.faces:
+                for vi, ti, ni in face:
+                    key = (vi, ti, ni)
+                    buf_idx = triple_to_buf.get(key)
+                    if buf_idx is None:
+                        buf_idx = len(buffer_to_obj_v)
+                        triple_to_buf[key] = buf_idx
+                        x, y, z = mesh.positions[vi]
+                        positions.extend((x, y, z))
+                        if ti >= 0 and ti < len(mesh.texcoords):
+                            u, v = mesh.texcoords[ti]
+                        else:
+                            u, v = 0.0, 0.0
+                        uvs.extend((u, v))
+                        if ni >= 0 and ni < len(mesh.normals):
+                            nx, ny, nz = mesh.normals[ni]
+                        else:
+                            nx, ny, nz = 0.0, 0.0, 1.0
+                        normals.extend((nx, ny, nz))
+                        buffer_to_obj_v.append(vi)
+                    indices.append(buf_idx)
+
+            cache = {
+                "positions": positions,
+                "uvs": uvs,
+                "normals": normals,
+                "indices": indices,
+                "buffer_to_obj_v": buffer_to_obj_v,
+                "n_buffer_vertices": len(buffer_to_obj_v),
+                "n_obj_vertices": len(mesh.positions),
+                "n_faces": len(mesh.faces),
+            }
+            preview_asset_obj_json._cache = cache  # type: ignore[attr-defined]
+        return jsonify(cache)
+
+    @app.get("/preview/assets/texture0.png")
+    def preview_asset_texture():
+        return send_from_directory(os.path.join(PROJECT_DIR, "imgs"), "texture0.png")
 
     @app.get("/health")
     def health():
@@ -1230,11 +1444,8 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
     def favicon():
         return redirect("data:,")
 
-    # Make the schema/params helpers available to tests via app context.
     app.config["PARAM_SCHEMA"] = PARAM_SCHEMA
     app.config["PARAM_DEFAULTS"] = PARAM_DEFAULTS
-    app.config["HEADEXT_PARAM_SCHEMA"] = HEADEXT_PARAM_SCHEMA
-    app.config["HEADEXT_PARAM_DEFAULTS"] = HEADEXT_PARAM_DEFAULTS
 
     return app
 
