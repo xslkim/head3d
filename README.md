@@ -325,65 +325,107 @@ points_full = concatenate([
 
 ## Web 服务
 
-如果想用浏览器上传图片并查看结果，可以启动本地 Web 服务：
+本地 Web 服务把发际线检测包装成"上传 → 实时调参"的交互界面。启动：
 
 ```bash
 python python/web_service.py
 ```
 
-默认地址：
+默认监听 `0.0.0.0:8000`。**所有发际线相关页面与接口都在 `/hairline` 命名空间下**（根路径 `/` 会 302 重定向到 `/hairline`），方便后续在 `/texture`、`/mesh3d` 等同级路径里加新功能，不互相干扰：
 
 ```text
-http://127.0.0.1:8000
+http://127.0.0.1:8000/hairline
 ```
 
-打开页面后选择一张 `jpg`、`png` 或 `webp` 图片，点击“开始分析”。服务会**并行运行多种发际线检测策略**（`python/hairline_2d.py` 中的所有 `sample_hairline_*` 函数），每个策略输出两张图（点和曲线）方便横向对比。
+### 固定策略：`lateral_extend_dense` + 转角保护平滑
 
-> **推荐用 `arch` 冠状弧策略 (列表第一个)**：从一只耳朵上方画到另一只耳朵上方覆盖整个头顶。它先用中间 11 个真正落在额头上的锚点 + 密度门限射线找到额头-头发边界，再把左右两端钉在头部 silhouette 上沿，按 x 等距插值出 17 个点，最终再用 silhouette 钳位防止越过头顶。
->
-> 其他 `arch_strict`、`arch_adj` 是同一思路的不同参数；`baseline` 等是历史方案（侧鬓位置不准）；`top_arc`、`silhouette_at_anchor_x` 等不依赖锚点；`density_*` 系列要求射线连续命中若干 hair 像素才停。
+经过多轮策略对比 (`baseline` / `adjacent` / `arch` / `window` / `density` / `inverse` / `boundary_proj` / ...) 已经确认 `sample_hairline_lateral_extend_dense` + `smooth_hairline_corner_aware` 在中间额头、上方转角、侧鬓三段都最贴合视觉发际线。Web 服务在 `v1-hairline` 之后固定只跑这一个策略，但通过 7 个可调参数 (slider) 暴露内部配置，让用户在线选取最适合自己照片的取值。
 
-每张结果图说明：
+算法管线：
 
-| 图片 | 内容 |
-|------|------|
-| 原图 | 上传的原始图片 |
-| 发际线点 | 17 个发际线采样点，绿色是真实命中、红色是几何外推回退（`arch` 系列没有红色，是用 silhouette 替代回退） |
-| 发际线 | 把 17 个采样点连成曲线，青色线段连接有效点 |
+1. **MediaPipe + face parsing**（上传时跑一次，缓存）。
+2. **种子加密**：在原始 17 个 `MP_TOP_ANCHORS` 之间按 `intermediates` 线性插入 N 个中间种子（默认 1，共 33 个种子点）。
+3. **射线探测**：每个种子沿 face-up 方向直上，命中首个 `hair` 像素（可选 `use_adjacent` 过滤背景误分为 hair 的像素，可选 `density_run_length` 要求连续 N 个 hair 才停）。
+4. **横向延伸**：最外侧 `outer_per_side` 个点沿 hit 横行向外侧推到可见 hair 边缘（上限 `max_walk_ratio × W`）。
+5. **转角保护平滑**：1-2-1 binomial 平滑 `smooth_iters` 次，但相邻三点夹角小于 `corner_cos_threshold` 时跳过该点不平滑，保住额头转角。
 
-如果想让局域网其他机器访问：
+| 参数 | 范围 | 默认 | 作用 |
+|------|------|------|------|
+| `intermediates` | 0–4 | 1 | 中间插入点数。最终点数 = 17 + 16 × N，即 17 / 33 / 49 / 65 / 81 |
+| `max_walk_ratio` (×1000) | 0–50 | 15 | 外侧锚点横向延伸幅度上限 (单位 0.1% 图宽)，0 关闭 |
+| `outer_per_side` | -1..15 | -1=auto | 应用横向延伸的外侧点数，-1 = `(intermediates+1)×3` |
+| `density_run_length` | 0–30 | 0 | 必须连续命中 N 个 hair 像素才算命中，0 = 一像素即停 |
+| `smooth_iters` | 0–5 | 2 | corner-aware 平滑迭代次数，0 = 不平滑显示 raw hit |
+| `corner_cos_threshold` (×100) | 0–100 | 60 | `cos(夹角) <` 阈值视为转角不平滑；越小越严，越大越多点保留 raw |
+| `use_adjacent` | bool | ON | 仅保留邻接 face skin 的 hair 像素，过滤背景误分 |
 
-```bash
-python python/web_service.py --host 0.0.0.0 --port 8000
+### 页面与 HTTP API
+
+| 路径 | 方法 | 作用 |
+|------|------|------|
+| `/` | GET | 302 → `/hairline` |
+| `/hairline` | GET | 上传 + 调参主页 |
+| `/hairline/analyze` | POST (multipart) | 上传图片，跑 parse + landmark + 一次默认参数渲染，返回完整调参页 |
+| `/hairline/api/render` | POST (JSON) | 用最新参数重渲染（命中缓存，~45 ms/帧） |
+| `/hairline/outputs/<filename>` | GET | 返回原图或渲染好的点图/曲线图 |
+| `/health` | GET | 健康检查，返回 `{ok, backend, cached: [stem...]}` |
+
+`/hairline/api/render` 请求体：
+
+```json
+{
+  "stem": "ae020b...user_red_hairline",
+  "params": {
+    "intermediates": 2,
+    "max_walk_ratio_x1000": 15,
+    "outer_per_side": -1,
+    "density_run_length": 4,
+    "smooth_iters": 2,
+    "corner_cos_x100": 60,
+    "use_adjacent": true
+  }
+}
 ```
 
-如果要指定人脸分割模型运行设备：
+响应：
 
-```bash
-python python/web_service.py --device cuda
-python python/web_service.py --device cpu
+```json
+{
+  "points_filename": "ae020b..._dense_points.png",
+  "curve_filename":  "ae020b..._dense_curve.png",
+  "n_total": 49,
+  "n_valid": 49,
+  "elapsed_ms": 44
+}
 ```
 
-Web 服务默认使用 `--landmark-backend subprocess`：每次分析都会启动一个独立子进程跑 MediaPipe FaceLandmarker，再把 468 个 landmark 通过临时 `.npy` 文件传回主进程。这样做的原因：
+页面里左侧 slider 触发 200 ms debounce 的 `/hairline/api/render` 请求，并用 `renderSeq` 单调递增的方式抛弃过期响应，所以拖动滑块时只看最新一帧。
 
-- 仍然走完整的 MediaPipe + face parsing 管线，发际线检测和后续 3D mesh 生成的 landmark 来源完全一致；
-- 子进程在 import mediapipe 之前会注入 `LIBGL_ALWAYS_SOFTWARE=1`、`MESA_LOADER_DRIVER_OVERRIDE=llvmpipe`、`MEDIAPIPE_DISABLE_GPU=1`、`EGL_PLATFORM=surfaceless` 等环境变量，绕开 WSL 下 D3D12 EGL 初始化导致 `mediapipe.tasks` 段错误的问题；
-- 即使 native 代码仍然崩溃，只会杀掉子进程，Web 服务保持运行，并把崩溃信号反馈到页面上。
+### 缓存
 
-如果你的环境已经稳定，可以选用进程内 backend：
+`HairlineWebAnalyzer` 维护一个 LRU 缓存 (容量 8 张) 存 `(rgb, parse_map, landmarks)`。**上传一次 → 此后所有调参渲染都不再跑 MediaPipe 或 SegFormer**，所以 slider 拖动是 CPU-only 流水（数十毫秒）。需要换图就重新上传。
 
-```bash
-python python/web_service.py --landmark-backend tasks      # 进程内 mediapipe.tasks
-python python/web_service.py --landmark-backend solutions  # 进程内 mediapipe.solutions（仅旧版 mediapipe 有）
-```
+### 命令行参数
 
-如果连子进程也崩，且暂时不需要 MediaPipe landmark，也可以退回纯分割估计：
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--host` | `0.0.0.0` | 监听地址，局域网外访问用 `0.0.0.0` |
+| `--port` | `8000` | 端口 |
+| `--device` | `$HEAD3D_DEVICE` | face parsing 推理设备 (`cuda` / `cpu` / 默认自动) |
+| `--landmark-backend` | `subprocess` | 见下表 |
+| `--threaded` | off | 开启 Flask 多线程请求（默认关闭以避免 MediaPipe 在某些平台的线程问题） |
+| `--debug` | off | Flask debug 模式 |
 
-```bash
-python python/web_service.py --landmark-backend parsing
-```
+`--landmark-backend` 取值：
 
-生成的上传图片和结果图会保存在 `data/web/`。第一次点击分析时主进程会加载 SegFormer 分割模型，子进程会加载 MediaPipe 模型；之后请求里 SegFormer 复用已加载的模型，MediaPipe 子进程每次都会重新加载（换来的是稳定性）。服务默认关闭 Flask 多线程请求处理；如果确认环境稳定，可以加 `--threaded` 开启多线程请求。
+| backend | 说明 |
+|---------|------|
+| `subprocess` (默认) | 每次分析都启动一个子进程跑 MediaPipe FaceLandmarker，子进程在 `import mediapipe` 之前注入 `LIBGL_ALWAYS_SOFTWARE=1` / `MESA_LOADER_DRIVER_OVERRIDE=llvmpipe` / `MEDIAPIPE_DISABLE_GPU=1` / `EGL_PLATFORM=surfaceless` 等环境变量绕开 WSL 下 EGL 段错误；即使 native 代码崩了也只会杀掉子进程，Web 服务保持运行 |
+| `tasks` | 进程内 `mediapipe.tasks.vision.FaceLandmarker`（环境稳定时最快） |
+| `solutions` | 进程内 `mediapipe.solutions.face_mesh`（仅旧版 mediapipe 有） |
+| `parsing` | 不跑 MediaPipe，只用 face parsing 估计发际线（用作终极兜底，会丢失锚点） |
+
+上传图片与渲染结果都写在 `data/web/`，命名是 `<uuid>_<原文件名>_dense_(points|curve).png`。这个目录在 `.gitignore` 里，不入版本控制。
 
 ## 可视化和调试
 

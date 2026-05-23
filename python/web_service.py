@@ -482,7 +482,7 @@ INDEX_HTML = """
     <section class="hero">
       <h1>发际线分析 · lateral_extend_dense 实时调参</h1>
       <p class="muted">上传一张正脸照片后, 在左侧滑块上调整任何参数都会立即重新渲染发际线 (parse map + landmarks 只在上传时跑一次)。</p>
-      <form action="/analyze" method="post" enctype="multipart/form-data">
+      <form action="/hairline/analyze" method="post" enctype="multipart/form-data">
         <input type="file" name="image" accept="image/png,image/jpeg,image/webp" required>
         <button class="primary" type="submit">上传 / 开始分析</button>
       </form>
@@ -593,8 +593,8 @@ INDEX_HTML = """
 
       function applyResult(j) {
         const t = Date.now();
-        $("img_points").src = "/outputs/" + j.points_filename + "?t=" + t;
-        $("img_curve").src  = "/outputs/" + j.curve_filename  + "?t=" + t;
+        $("img_points").src = "/hairline/outputs/" + j.points_filename + "?t=" + t;
+        $("img_curve").src  = "/hairline/outputs/" + j.curve_filename  + "?t=" + t;
         $("n_total").textContent = j.n_total;
         $("n_valid").textContent = j.n_valid;
         $("elapsed").textContent = j.elapsed_ms;
@@ -608,7 +608,7 @@ INDEX_HTML = """
         status.textContent = "渲染中…";
         status.className = "status busy";
         try {
-          const r = await fetch("/api/render", {
+          const r = await fetch("/hairline/api/render", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
             body: JSON.stringify({ stem: STEM, params: readParams() })
@@ -693,12 +693,19 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
     analyzer = HairlineWebAnalyzer(device=device, landmark_backend=landmark_backend)
     os.makedirs(WEB_DATA_DIR, exist_ok=True)
 
+    # All hairline-detection endpoints live under /hairline/* so future
+    # features (texture / 3D mesh / hair-style transfer / ...) can claim their
+    # own top-level namespaces without colliding.
     @app.get("/")
-    def index():
+    def root_index():
+        return redirect("/hairline", code=302)
+
+    @app.get("/hairline")
+    def hairline_index():
         return render_template_string(INDEX_HTML, init=None, error=None)
 
-    @app.post("/analyze")
-    def analyze():
+    @app.post("/hairline/analyze")
+    def hairline_analyze():
         upload = request.files.get("image")
         if upload is None or upload.filename == "":
             return render_template_string(INDEX_HTML, init=None, error="请选择一张图片。"), 400
@@ -724,7 +731,7 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
 
         init = AnalysisInit(
             original_name=safe_name,
-            original_url=f"/outputs/{original_filename}",
+            original_url=f"/hairline/outputs/{original_filename}",
             stem=stem,
             backend=analyzer.landmark_backend,
             prepare_ms=prepare_ms,
@@ -734,8 +741,8 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
         )
         return render_template_string(INDEX_HTML, init=init, error=None)
 
-    @app.post("/api/render")
-    def api_render():
+    @app.post("/hairline/api/render")
+    def hairline_api_render():
         payload = request.get_json(silent=True) or {}
         stem = payload.get("stem")
         if not isinstance(stem, str) or not stem:
@@ -752,8 +759,8 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
             return (str(exc), 500)
         return jsonify(result)
 
-    @app.get("/outputs/<path:filename>")
-    def outputs(filename: str):
+    @app.get("/hairline/outputs/<path:filename>")
+    def hairline_outputs(filename: str):
         return send_from_directory(WEB_DATA_DIR, filename)
 
     @app.get("/health")
