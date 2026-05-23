@@ -92,10 +92,24 @@ def canonical_extension_positions(
     return middle, hairline
 
 
-def extension_uvs() -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-    """Return UVs for middle row and hairline row, in OBJ raw V format."""
-    middle_uv   = [C.extension_uv_for(0, i) for i in range(C.N_ANCHORS)]
-    hairline_uv = [C.extension_uv_for(1, i) for i in range(C.N_ANCHORS)]
+def extension_uvs(
+    mesh: ObjMesh,
+    inv_index_map: dict[int, int],
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Return UVs for middle row and hairline row, in OBJ raw V format.
+
+    Each new vertex copies the U of the corresponding MP anchor so the
+    ribbon triangle column is vertical in UV space; only V differs
+    between anchor / middle / hairline. See constants.extension_uv_for
+    for why.
+    """
+    middle_uv: list[tuple[float, float]] = []
+    hairline_uv: list[tuple[float, float]] = []
+    for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+        anchor_obj_idx = inv_index_map[mp_idx]
+        anchor_u = mesh.texcoords[anchor_obj_idx][0]
+        middle_uv.append(C.extension_uv_for(0, anchor_u))
+        hairline_uv.append(C.extension_uv_for(1, anchor_u))
     return middle_uv, hairline_uv
 
 
@@ -144,7 +158,7 @@ def main() -> None:
 
     # Compute extension data
     middle_pos, hairline_pos = canonical_extension_positions(base, inv)
-    middle_uv,  hairline_uv  = extension_uvs()
+    middle_uv,  hairline_uv  = extension_uvs(base, inv)
     ext_normals = extension_normals()
     ext_faces   = build_extension_faces(inv)
 

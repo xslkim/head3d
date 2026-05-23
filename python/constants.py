@@ -48,27 +48,50 @@ HAIRLINE_START = N_MP + N_ANCHORS # 485
 HEAD_ARC_RADIUS_FRAC = 0.30
 
 
-# UV layout: the extension occupies a thin strip near the top edge of UV
-# space (V close to 1.0). The strip is two rows (middle / hairline) by
-# N_ANCHORS columns. Tune the band so it lands on empty pixels in your
-# texture atlas. Each value is a pre-flip (raw OBJ) V; the loader does
-# `1 - v` at load time, so the actual top of the texture in image space
-# corresponds to a low V value here.
-UV_STRIP_U_MIN = 0.05
-UV_STRIP_U_MAX = 0.95
-UV_MIDDLE_V    = 0.02   # raw OBJ value; near the top of the texture
-UV_HAIRLINE_V  = 0.005  # very top edge
+# UV layout for the 34 forehead-extension vertices.
+#
+# The texture (imgs/texture0.png, 512×512) is laid out with the original
+# MediaPipe face skin in V_raw ≈ 0.00..0.77 (image y ≈ 117..511) and a
+# horizontal stack of 5 hairline-design arcs at the TOP of the image
+# (image y ≈ 30..170, i.e. V_raw ≈ 0.67..0.94). Those 5 arcs are the
+# content that the extension strip is supposed to display: hairline row
+# samples the topmost arc (blue), middle row samples the bottom arc
+# (orange), and the 3 arcs in between fall out automatically because the
+# ribbon triangle interpolates V linearly between the two rows.
+#
+# V conventions
+# -------------
+# uv_template.py / Three.js (with texture.flipY=true) treat V_raw=1 as
+# the TOP of the image (image y=0) and V_raw=0 as the BOTTOM.
+#
+# U conventions — IMPORTANT
+# -------------------------
+# The 17 MP_TOP_ANCHORS in face.obj have NON-uniform u (≈ 0.00 at the
+# temples, ≈ 0.50 at the forehead center, ≈ 1.00 at the other temple).
+# Each ribbon triangle (anchor[i] → middle[i] → anchor[i+1] etc.) is a
+# vertical column in UV space ONLY when the middle/hairline vertex
+# inherits its U from the corresponding anchor. If we used a uniform
+# 0.05..0.95 U for the strip the columns would slant relative to the
+# anchor U values, warping the texture's 5 horizontal arcs into
+# zig-zags. So `extension_uv_for` takes `anchor_u` and copies it.
+UV_MIDDLE_V    = 0.820   # raw OBJ V → image y ≈  92 (magenta / middle arc)
+UV_HAIRLINE_V  = 0.940   # raw OBJ V → image y ≈  31 (blue / top arc)
+# face.obj 中 17 个 MP_TOP_ANCHORS 的 V_raw 最大值 ≈ 0.7724 (额头中央 MP 10).
+# UV_MIDDLE_V 必须 > 0.7724, 否则 anchor → middle 这一段 V 方向会反向, 三角形
+# 会被翻转, 贴图弧线在那 3 列出现锯齿/折叠。 当前 0.82 同时落在贴图品红弧线
+# (V_raw ≈ 0.824) 上, 蓝/紫/品红 3 条弧线都会原位采到, 红/橙 2 条弧线通过
+# anchor 行的 V 插值出现在 anchor 与 middle 之间的过渡带。
 
 
-def extension_uv_for(row: int, col: int) -> tuple[float, float]:
-    """Return (u, v) UV coords for the (row, col) extension vertex.
+def extension_uv_for(row: int, anchor_u: float) -> tuple[float, float]:
+    """Return (u, v_raw) UV for an extension vertex.
 
-    row: 0 = middle, 1 = hairline.
-    col: 0..N_ANCHORS-1 (left to right).
+    row:       0 = middle, 1 = hairline.
+    anchor_u:  U of the MP anchor this extension vertex sits above (copy
+               it verbatim so the ribbon triangle is vertical in UV space).
     """
-    u = UV_STRIP_U_MIN + (UV_STRIP_U_MAX - UV_STRIP_U_MIN) * (col / (N_ANCHORS - 1))
     v = UV_MIDDLE_V if row == 0 else UV_HAIRLINE_V
-    return (u, v)
+    return (anchor_u, v)
 
 
 # Face-parsing class indices for the jonathandinu/face-parsing

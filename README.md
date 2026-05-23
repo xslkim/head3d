@@ -507,22 +507,23 @@ triangles: 852 -> 916   (+64)
 
 ## UV 和贴图
 
-新增 34 个顶点有自己的静态 UV，定义在 `python/constants.py`：
+新增 34 个顶点的 UV 由 `python/constants.py` 的 `extension_uv_for(row, anchor_u)` 给出：
 
 ```python
-UV_STRIP_U_MIN = 0.05
-UV_STRIP_U_MAX = 0.95
-UV_MIDDLE_V = 0.02
-UV_HAIRLINE_V = 0.005
+UV_MIDDLE_V    = 0.820   # raw OBJ V  → image y ≈  92  (品红弧线 / 中间行)
+UV_HAIRLINE_V  = 0.940   # raw OBJ V  → image y ≈  31  (蓝弧线 / 发际线行)
+# U: 直接继承对应 MP_TOP_ANCHORS[i] 的 U
 ```
 
 含义：
 
-- `U` 从左到右铺满一条细长区域，对应 17 列锚点。
-- `V` 有两行：一行给中间行，一行给发际线行。
-- OBJ 里写的是 raw V，SDK 加载 OBJ 时会做 `1 - v` 翻转，所以这里的低 V 对应贴图图片的上方区域。
+- **U**: middle[i] 和 hairline[i] **直接复制** MP_TOP_ANCHORS[i] 这个 anchor 的 U。 anchor 17 个 U 是非均匀的 (`0.001..0.999`, 太阳穴附近 ≈ 0, 额头中央 ≈ 0.5)，ribbon 三角形列只有让 middle/hairline 跟着 anchor 的 U 才会**在 UV 空间里垂直**, 贴图 5 条横向弧线才不会被 ribbon 三角形扭成 Z 字形。 ❌ 如果用 0.05..0.95 均匀分布 U, 弧线会被斜拉。
+- **V**: anchor 行 V_raw ∈ [0.40, 0.77], middle 行 V_raw=0.82 (品红弧线), hairline 行 V_raw=0.94 (蓝弧线) — 全 17 列 anchor.V < middle.V < hairline.V 严格单调递增 (这是硬约束, anchor 最大 V 是额头中央 MP 10 的 0.7724, 所以 UV_MIDDLE_V 必须 > 0.7724 否则 ribbon 三角形 V 反向, 会出现局部贴图翻转折叠)。 品红和蓝两条弧线分别原位采到 middle / hairline 行, 其余 3 条弧线 (橙/红/紫) 通过 V 方向插值自动展开在 anchor → middle → hairline 的过渡带上。
+- OBJ 里写的是 raw V, Three.js 用默认 `texture.flipY=true` 时 V_raw=1 直接对应贴图图片顶部, 不需要再翻转。
 
-如果你的纹理图集里这块区域已经被占用，需要调整这些常量，然后重新运行：
+> ⚠️ 历史教训: 早期 `UV_MIDDLE_V=0.02 / UV_HAIRLINE_V=0.005` 把 ribbon UV 放到了贴图**底部**空白区 (img y ≈ 502..510), 结果 34 个新点采样全是白色, 发际线带完全看不见。 而贴图实际内容 (5 条彩色弧线) 一直在顶部 V_raw ≈ 0.67..0.94。 修复后, 在 `/preview` 顶部 ortho overlay 上能直接看到 5 条弧线投影在额头到发际线区域。
+
+如果改了 `texture0.png` 把图块挪到别的位置, 同步调 `UV_MIDDLE_V` / `UV_HAIRLINE_V` (两个 V 值不一定相邻, 但要保证 anchor.V_min < UV_MIDDLE_V < UV_HAIRLINE_V <= 1, 否则 V 方向插值会反向), 然后重生成：
 
 ```bash
 python python/build_extended_obj.py
@@ -583,7 +584,6 @@ shader 和贴图采样逻辑不需要改；新增顶点已经在 OBJ 里有 UV�
 |------|------|------------|
 | `MP_TOP_ANCHORS` | 17 个 MediaPipe 额头上沿锚点 | 射线起点不合理、漏掉太阳穴、整体发际线偏移 |
 | `HEAD_ARC_RADIUS_FRAC` | 矢状-arc 半径占脸高的比例 (默认 0.30) | hairline/middle 在 3D 里贴脸太紧或太靠后, 取值越小向头后弯曲越快 |
-| `UV_STRIP_U_MIN/MAX` | 新增区域在贴图里的横向范围 | 贴图内容横向拉伸、压缩或碰到其他图块 |
 | `UV_MIDDLE_V` | 中间行贴图 V 坐标 | 中间行采样到错误贴图位置 |
 | `UV_HAIRLINE_V` | 发际线行贴图 V 坐标 | 发际线边缘采样到错误贴图位置 |
 | `fallback_extrapolation` | 射线找不到头发时的外推距离 | 秃头、头顶出框、分割失败时回退点太高或太低 |
