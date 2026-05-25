@@ -54,11 +54,13 @@ HEAD_ARC_RADIUS_FRAC = 0.30
 # ribbon's top row should sit at the crown of the head instead, so the
 # texture-overlay band can cover the whole forehead → crown region.
 #
-# 0.10 ≈ moves the hairline row up by 10% of face height (~half the
-# distance from the detected hairline to the visible crown on a typical
-# frontal photo). Bump it to 0.15..0.20 for taller forehead / higher
-# crown; drop to 0.05 to keep the ribbon close to the hair-skin boundary.
-HAIRLINE_CROWN_LIFT_FRAC = 0.10
+# 0.06 ≈ moves the hairline row up by 6% of face height, which on the
+# reference photos lands the top row just above the visible hairline and
+# below the crown — empirically tuned with the /preview slider and locked
+# in as the project default. Bump to 0.10..0.15 for taller foreheads /
+# higher crowns; drop to 0.03 to keep the ribbon hugging the hair-skin
+# boundary.
+HAIRLINE_CROWN_LIFT_FRAC = 0.06
 
 
 # UV layout for the 34 forehead-extension vertices.

@@ -8,7 +8,7 @@ mesh generation depends on.
 
 Usage:
   python python/web_service.py
-  python python/web_service.py --host 0.0.0.0 --port 8000 --device cuda
+  python python/web_service.py --host 0.0.0.0 --port 18001 --device cuda
   python python/web_service.py --landmark-backend tasks      # in-process MediaPipe
   python python/web_service.py --landmark-backend solutions  # legacy mp.solutions
   python python/web_service.py --landmark-backend parsing    # no MediaPipe (fallback)
@@ -828,6 +828,8 @@ PREVIEW_HTML = """
     .nav-links a:hover { text-decoration: underline; }
     .status { font-size: 12px; color: #6b7280; margin-left: 8px; }
     .status.busy { color: #b45309; } .status.err { color: #991b1b; }
+    .uv-tex-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+    @media (max-width: 900px) { .uv-tex-grid { grid-template-columns: 1fr; } }
   </style>
 </head>
 <body>
@@ -859,23 +861,9 @@ PREVIEW_HTML = """
           <div class="item"><span class="swatch" style="background:#ffc864"></span> v1 hairline 17</div>
         </div>
         <div class="meta" id="meta">--</div>
-        <div style="margin-top:14px; padding:10px 12px; border:1px dashed #cbd5e1; border-radius:8px;">
-          <label for="crown_lift" style="display:flex; gap:8px; align-items:center; font-size:13px; font-weight:600; color:#1f2937;">
-            发际线行向头顶外推 (crown lift, % 脸高)
-            <span id="crown_lift_val" style="font-family:ui-monospace,monospace; color:#1d4ed8;">10</span>
-            <span id="crown_lift_status" class="status">--</span>
-          </label>
-          <input type="range" id="crown_lift" min="0" max="40" step="1" value="10" style="width:100%; margin-top:6px;">
-          <div style="display:flex; justify-content:space-between; font-size:11px; color:#6b7280; margin-top:2px;">
-            <span>0 = 贴发际线 (检测原位)</span>
-            <span>10 = 默认 (≈半段到头顶)</span>
-            <span>30+ = 到头顶</span>
-          </div>
-          <div style="font-size:11px; color:#6b7280; margin-top:6px; line-height:1.4;">
-            把 17 个 hairline 顶点沿 face-up 方向再多推 N% × face_h, 同时 middle 行自动取
-            anchor 与 hairline 的中点。 z 用矢状-arc 公式重新解, 越往头顶 z 越靠后, 仍贴在头骨曲面上。
-          </div>
-        </div>
+        <p class="muted" style="margin-top:10px; font-size:11px; line-height:1.4;">
+          crown_lift 已锁定为 6% face_h (HAIRLINE_CROWN_LIFT_FRAC), face_ext.obj 与运行时检测都用同一个常数。
+        </p>
       </article>
 
       <article class="card">
@@ -905,6 +893,49 @@ PREVIEW_HTML = """
       </article>
     </section>
 
+    <section class="card" style="margin-top:18px;">
+      <h2 class="panel-title">UV 拓扑底图 & 自定义贴图 <small>美术拿这张图去画, 上传 PNG 即可预览效果</small></h2>
+      <div class="uv-tex-grid">
+        <div>
+          <div style="background:#fff; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden;">
+            <img id="uv_template_img" src="/preview/assets/uv_template.png" alt="UV 拓扑底图" style="display:block; width:100%; height:auto;">
+          </div>
+          <div style="margin-top:10px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; font-size:12px;">
+            <a id="uv_download" class="primary" style="text-decoration:none; padding:7px 14px; background:#2563eb; color:#fff; border-radius:8px; font-weight:600;" href="/preview/assets/uv_template.png" download="uv_template.png">下载 PNG</a>
+            <label style="display:flex; gap:6px; align-items:center; cursor:pointer;">
+              <input type="checkbox" id="uv_overlay_toggle"> 叠加当前 texture0 对比
+            </label>
+            <span class="muted">512x512 · face_ext.obj 的 UV 拓扑参考</span>
+          </div>
+          <p class="muted" style="margin-top:8px; font-size:11px; line-height:1.5;">
+            分区色编与下方贴图一致: MP 468 浅灰, v1 middle 17 橙, v1 hairline 17 黄.
+            V_raw=1 对应图片顶部 (Three.js flipY=true). 美术保持画布 512x512 即可.
+          </p>
+        </div>
+        <div>
+          <h3 style="margin:0 0 8px; font-size:13px; color:#374151;">
+            上传自定义贴图 <span id="tex_status" class="status">默认 texture0.png</span>
+          </h3>
+          <input type="file" id="tex_upload" accept="image/png,image/jpeg,image/webp"
+                 style="width:100%; box-sizing:border-box; border:1px dashed #9ca3af; border-radius:10px; background:#f9fafb; padding:12px;">
+          <div style="margin-top:8px; display:flex; gap:10px; flex-wrap:wrap;">
+            <button id="tex_reset" type="button"
+                    style="border:1px solid #cbd5e1; background:#fff; color:#1f2937; border-radius:8px; padding:7px 14px; cursor:pointer; font-weight:600;">
+              恢复默认 texture0
+            </button>
+          </div>
+          <div style="margin-top:12px;">
+            <div class="muted" style="font-size:12px;">当前贴图预览</div>
+            <img id="tex_current_preview" src="/preview/assets/texture0.png" alt="current texture"
+                 style="display:block; max-width:100%; height:auto; margin-top:6px; border:1px solid #e5e7eb; border-radius:8px; background:#111827;">
+          </div>
+          <p class="muted" style="margin-top:8px; font-size:11px; line-height:1.5;">
+            上传后右上 ortho overlay 与右下 canonical viewer 同步切换. 仅当前浏览器会话生效, 不会覆盖 imgs/texture0.png.
+          </p>
+        </div>
+      </div>
+    </section>
+
     <script type="importmap">
     {
       "imports": {
@@ -926,24 +957,23 @@ PREVIEW_HTML = """
       }
 
       // --- Fetch detected points -----------------------------------------
-      // currentData is updated whenever the slider triggers a refetch; the
-      // live-overlay mesh and left dot-overlay re-render from it.
+      // crown_lift is now locked to C.HAIRLINE_CROWN_LIFT_FRAC server-side
+      // (the slider was removed). The page fetches the detected mesh once
+      // per upload and never re-issues with a different lift.
+      // textureMeshRefs collects each viewer's { material, getTex, setTex }
+      // so the upload handler can hot-swap textures on both viewers at once.
       let currentData = null;
-      const liveMeshRefs = { geom: null, bufferToObj: null };       // filled by setupLiveOverlay
-      const canonicalMeshRefs = { geom: null, bufferToObj: null };  // filled by setupCanonicalViewer
+      const textureMeshRefs = [];
 
-      async function fetchData(crownLiftX100) {
-        const url = (crownLiftX100 === null || crownLiftX100 === undefined)
-          ? '/preview/api/data/' + STEM
-          : '/preview/api/data/' + STEM + '?crown_lift_x100=' + crownLiftX100;
-        const r = await fetch(url);
+      async function fetchData() {
+        const r = await fetch('/preview/api/data/' + STEM);
         if (!r.ok) throw new Error('GET /preview/api/data failed: ' + r.status);
         return await r.json();
       }
 
       let dataPromise = (async () => {
         setStatus('载入识别点 …', 'busy');
-        currentData = await fetchData(null);
+        currentData = await fetchData();
         return currentData;
       })();
 
@@ -996,54 +1026,77 @@ PREVIEW_HTML = """
 
       dataPromise.then(redrawDotsAndMeta).catch(e => setStatus('左侧渲染失败: ' + e, 'err'));
 
-      // --- Slider: re-fetch on crown_lift change -------------------------
-      const lift_input = document.getElementById('crown_lift');
-      const lift_val   = document.getElementById('crown_lift_val');
-      const lift_status = document.getElementById('crown_lift_status');
-      let liftSeq = 0, liftTimer = null;
+      // --- UV template image: clean ⇄ overlay (with current texture0) ----
+      const uvImg      = document.getElementById('uv_template_img');
+      const uvDownload = document.getElementById('uv_download');
+      document.getElementById('uv_overlay_toggle').addEventListener('change', e => {
+        const path = e.target.checked
+          ? '/preview/assets/uv_template_overlay.png'
+          : '/preview/assets/uv_template.png';
+        const filename = e.target.checked ? 'uv_template_overlay.png' : 'uv_template.png';
+        uvImg.src = path;
+        uvDownload.href = path;
+        uvDownload.setAttribute('download', filename);
+      });
 
-      async function fetchCanonicalPositions(crownLiftX100) {
-        const url = '/preview/assets/canonical_positions?crown_lift_x100=' + crownLiftX100;
-        const r = await fetch(url);
-        if (!r.ok) throw new Error('GET canonical_positions failed: ' + r.status);
-        return await r.json();
+      // --- Texture hot-swap pipeline -------------------------------------
+      // Each viewer (top ortho overlay + bottom canonical) registers its
+      // material into textureMeshRefs after init. swapTextureURL(url) loads
+      // a new THREE.Texture, points every registered material at it, and
+      // disposes the previous one. The same pipeline serves both the
+      // upload-button path and the reset-to-default button.
+      async function loadTextureURL(url) {
+        const t = await new Promise((res, rej) => {
+          new THREE.TextureLoader().load(url, res, undefined, rej);
+        });
+        t.colorSpace = THREE.SRGBColorSpace;
+        t.flipY = true;
+        t.needsUpdate = true;
+        return t;
       }
 
-      async function applyCrownLift(v) {
-        const seq = ++liftSeq;
-        lift_status.textContent = '渲染中…';
-        lift_status.className = 'status busy';
+      const texStatus  = document.getElementById('tex_status');
+      const texPreview = document.getElementById('tex_current_preview');
+
+      async function swapTextureURL(url, label) {
+        texStatus.textContent = '载入贴图…'; texStatus.className = 'status busy';
         try {
-          // Fire both requests in parallel: detected mesh (per-image) and
-          // canonical mesh (per-lift). They share the slider value but
-          // come from independent server-side caches.
-          const [j, canon] = await Promise.all([
-            fetchData(v),
-            fetchCanonicalPositions(v),
-          ]);
-          if (seq !== liftSeq) return;
-          currentData = j;
-          redrawDotsAndMeta(j);
-          if (liveMeshRefs.geom && liveMeshRefs.bufferToObj) {
-            applyDetectedPositions(liveMeshRefs.geom, liveMeshRefs.bufferToObj, j.points_obj_order);
+          const newTex = await loadTextureURL(url);
+          for (const ref of textureMeshRefs) {
+            const old = ref.material.map;
+            ref.material.map = newTex;
+            ref.material.needsUpdate = true;
+            if (old && old !== newTex) old.dispose();
           }
-          if (canonicalMeshRefs.geom && canonicalMeshRefs.bufferToObj) {
-            applyFlatPositions(canonicalMeshRefs.geom, canonicalMeshRefs.bufferToObj, canon.positions);
-          }
-          lift_status.textContent = '✓';
-          lift_status.className = 'status';
+          texPreview.src = url;
+          texStatus.textContent = label || '✓ 已切换';
+          texStatus.className = 'status';
         } catch (e) {
-          if (seq === liftSeq) {
-            lift_status.textContent = '错误: ' + e;
-            lift_status.className = 'status err';
-          }
+          texStatus.textContent = '错误: ' + e.message;
+          texStatus.className = 'status err';
         }
       }
 
-      lift_input.addEventListener('input', () => {
-        lift_val.textContent = lift_input.value;
-        if (liftTimer) clearTimeout(liftTimer);
-        liftTimer = setTimeout(() => { liftTimer = null; applyCrownLift(parseInt(lift_input.value, 10)); }, 180);
+      document.getElementById('tex_upload').addEventListener('change', async e => {
+        const file = e.target.files[0];
+        if (!file) return;
+        texStatus.textContent = '上传中…'; texStatus.className = 'status busy';
+        try {
+          const fd = new FormData();
+          fd.append('texture', file);
+          const r = await fetch('/preview/api/texture', { method: 'POST', body: fd });
+          if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + (await r.text()));
+          const j = await r.json();
+          await swapTextureURL(j.url, '✓ 已切换到 ' + file.name);
+        } catch (err) {
+          texStatus.textContent = '上传失败: ' + err.message;
+          texStatus.className = 'status err';
+        }
+      });
+
+      document.getElementById('tex_reset').addEventListener('click', () => {
+        document.getElementById('tex_upload').value = '';
+        swapTextureURL('/preview/assets/texture0.png', '已恢复 texture0.png');
       });
 
       // --- Right: TOP = ortho overlay on photo, BOTTOM = 3D canonical ----
@@ -1199,16 +1252,11 @@ PREVIEW_HTML = """
         tex.flipY = true;
         tex.needsUpdate = true;
 
-        // Save refs so the crown-lift slider can update canonical positions
-        // without rebuilding the geometry. Initial positions already match
-        // C.HAIRLINE_CROWN_LIFT_FRAC because face_ext.obj was built with it.
-        canonicalMeshRefs.geom = geom;
-        canonicalMeshRefs.bufferToObj = bufferToObj;
-
         const matTex = buildBaseMaterial(tex);
         const matWire = new THREE.MeshBasicMaterial({
           color: 0x55ff88, wireframe: true, transparent: true, opacity: 0.6,
         });
+        textureMeshRefs.push({ material: matTex });
 
         const mesh = new THREE.Mesh(geom, matTex);
         mesh.scale.set(1, -1, -1);
@@ -1262,10 +1310,6 @@ PREVIEW_HTML = """
             ' != OBJ vertex count ' + nObjVertices + ', rendering overlap only.');
         }
         applyDetectedPositions(geom, bufferToObj, data.points_obj_order);
-        // Expose geom + mapping so the crown-lift slider can update positions
-        // without rebuilding the mesh.
-        liveMeshRefs.geom = geom;
-        liveMeshRefs.bufferToObj = bufferToObj;
 
         const matTex = new THREE.MeshBasicMaterial({
           map: tex, side: THREE.DoubleSide, color: 0xffffff,
@@ -1275,6 +1319,7 @@ PREVIEW_HTML = """
           color: 0x55ff88, wireframe: true, transparent: true, opacity: 0.7,
           depthTest: false,
         });
+        textureMeshRefs.push({ material: matTex });
 
         const mesh = new THREE.Mesh(geom, matTex);
         const wire = new THREE.Mesh(geom, matWire);
@@ -1603,6 +1648,54 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
     def preview_asset_texture():
         return send_from_directory(os.path.join(PROJECT_DIR, "imgs"), "texture0.png")
 
+    @app.get("/preview/assets/uv_template.png")
+    def preview_asset_uv_template():
+        return send_from_directory(os.path.join(PROJECT_DIR, "imgs"), "uv_template.png")
+
+    @app.get("/preview/assets/uv_template_overlay.png")
+    def preview_asset_uv_template_overlay():
+        return send_from_directory(os.path.join(PROJECT_DIR, "imgs"), "uv_template_overlay.png")
+
+    _UPLOAD_TEX_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+    _UPLOAD_TEX_MAX_BYTES = 16 * 1024 * 1024  # 16 MB
+
+    @app.post("/preview/api/texture")
+    def preview_api_texture_upload():
+        """Receive a user-painted effect texture and stash it in WEB_DATA_DIR.
+
+        Returns ``{ url, filename }``. The page swaps both viewers' material
+        maps to this URL — session-only, never overwrites imgs/texture0.png.
+        Files share WEB_DATA_DIR with photo uploads and are reachable via
+        the existing ``/preview/outputs/<filename>`` route.
+        """
+        f = request.files.get("texture")
+        if f is None or not f.filename:
+            return ("missing 'texture' file part", 400)
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in _UPLOAD_TEX_EXTS:
+            return (f"unsupported format {ext!r}; use PNG/JPG/WebP", 400)
+        # Content-Length is a hint; werkzeug also enforces MAX_CONTENT_LENGTH
+        # if set on the app — we keep a soft cap by streaming to disk and
+        # truncating if it exceeds the limit, then rejecting.
+        name = f"tex_{uuid.uuid4().hex}{ext}"
+        path = os.path.join(WEB_DATA_DIR, name)
+        f.save(path)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        if size > _UPLOAD_TEX_MAX_BYTES:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return (f"file too large: {size} bytes > {_UPLOAD_TEX_MAX_BYTES}", 413)
+        return jsonify({
+            "url": f"/preview/outputs/{name}",
+            "filename": name,
+            "size": size,
+        })
+
     @app.get("/health")
     def health():
         return {"ok": True, "backend": analyzer.landmark_backend, "cached": list(analyzer._cache.keys())}
@@ -1626,7 +1719,7 @@ def create_app(device: str | None = None, landmark_backend: str = "subprocess"):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the local hairline analysis web service.")
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=18001)
     parser.add_argument("--device", default=os.environ.get("HEAD3D_DEVICE"))
     parser.add_argument(
         "--landmark-backend",

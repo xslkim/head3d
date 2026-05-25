@@ -337,10 +337,10 @@ points_full = concatenate([
 python python/web_service.py
 ```
 
-默认监听 `0.0.0.0:8000`。**所有发际线相关页面与接口都在 `/hairline` 命名空间下**（根路径 `/` 会 302 重定向到 `/hairline`），方便后续在 `/texture`、`/mesh3d` 等同级路径里加新功能，不互相干扰：
+默认监听 `0.0.0.0:18001`。**所有发际线相关页面与接口都在 `/hairline` 命名空间下**（根路径 `/` 会 302 重定向到 `/hairline`），方便后续在 `/texture`、`/mesh3d` 等同级路径里加新功能，不互相干扰：
 
 ```text
-http://127.0.0.1:8000/hairline
+http://127.0.0.1:18001/hairline
 ```
 
 ### 固定策略：`lateral_extend_dense` + 转角保护平滑
@@ -416,7 +416,7 @@ http://127.0.0.1:8000/hairline
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--host` | `0.0.0.0` | 监听地址，局域网外访问用 `0.0.0.0` |
-| `--port` | `8000` | 端口 |
+| `--port` | `18001` | 端口 |
 | `--device` | `$HEAD3D_DEVICE` | face parsing 推理设备 (`cuda` / `cpu` / 默认自动) |
 | `--landmark-backend` | `subprocess` | 见下表 |
 | `--threaded` | off | 开启 Flask 多线程请求（默认关闭以避免 MediaPipe 在某些平台的线程问题） |
@@ -533,11 +533,16 @@ python python/build_extended_obj.py
 
 ## /preview 3D 端到端验证页
 
-`/preview` 用来肉眼确认 502 点的 3D 位置和 OBJ canonical mesh 是否一致, 是这一轮 "新加的点是否贴皮肤" 的回归检查面板。
+`/preview` 用来肉眼确认 502 点的 3D 位置和 OBJ canonical mesh 是否一致, 是这一轮 "新加的点是否贴皮肤" 的回归检查面板, 同时也是美术拿 UV 底图、上传自画贴图做预览的入口。
 
 * **左** = 原图 + 502 识别点 (MP / v1 middle / v1 hairline 三组色编)。下方 meta 行打出 `⟨ z(hairline) − z(MP anchor) ⟩` 这个指标 —— **必须 > 0** 才说明 hairline 在 anchor 的后方 (头骨向后弯), 贴皮肤; 一旦 ≤ 0 就说明矢状-arc 模型回退到了直接抄 anchor Z 的旧 bug。
 * **右上** = ortho 正交投影 overlay。原图当底, 贴图 mesh 叠在上面 (与原图严格像素对齐), 用来确认贴图 UV 与活脸 mesh 在画面上对得上。可切贴图/线框/不透明度。
 * **右下** = `face_ext.obj` canonical 模板, 可拖动旋转。用来确认 canonical mesh 本身没有 z 翻号 / UV 错位。
+* **底部 card** = UV 拓扑底图 + 自定义贴图上传:
+  - 左半边显示 `imgs/uv_template.png` (512x512), 提供"下载 PNG"和"叠加当前 texture0 对比"切换 — 美术下载这张图作为画布。
+  - 右半边一个文件输入和"恢复默认 texture0"按钮 — 上传 PNG/JPG/WebP 后, 右上 overlay + 右下 canonical 会同步切换到新贴图, 仅在当前浏览器会话生效, 不会覆盖 `imgs/texture0.png`。
+
+`crown_lift` 已经在 `python/constants.py` 锁定为 `HAIRLINE_CROWN_LIFT_FRAC = 0.06` (6% face_h, 由 /preview 旧 slider 调出来的经验值)。运行时检测和 `face_ext.obj` 都用同一个常数, 不再在 web 界面暴露。要改的话: 改这个常数 → `python -m python.build_extended_obj` 重生成 `face_ext.obj` → `python python/uv_template.py face_ext.obj --out imgs/uv_template.png` 刷新底图 → 同步 C++ 侧 (UV 不变, 几何会变)。
 
 HTTP：
 
@@ -546,8 +551,12 @@ HTTP：
 | `/preview` | GET | 3D 验证页上传入口 |
 | `/preview/analyze` | POST (multipart) | 上传 + 算 502 点 |
 | `/preview/api/data/<stem>` | GET | 该 stem 的 502 点 (MP-order + OBJ-order) |
+| `/preview/api/texture` | POST (multipart) | 上传自定义效果贴图, 返回 `{ url, filename, size }`; 仅 PNG/JPG/WebP, ≤ 16 MB |
 | `/preview/assets/face_ext.json` | GET | OBJ 的 indexed-geometry JSON, Three.js 直接灌进 `BufferGeometry` |
 | `/preview/assets/{face_ext.obj,texture0.png}` | GET | 静态资源 |
+| `/preview/assets/uv_template.png` | GET | UV 拓扑底图 (纯白底 + 线框 + 分区色), 美术作画用 |
+| `/preview/assets/uv_template_overlay.png` | GET | 同上, 但底图换成当前 `texture0.png`, 用于对位检查 |
+| `/preview/outputs/<filename>` | GET | 用户上传的原图 / 自定义贴图回读 |
 
 `/hairline` 页右上角有跳转链接；两个页面共享 stem，上传一次即可来回调。
 
@@ -586,8 +595,9 @@ shader 和贴图采样逻辑不需要改；新增顶点已经在 OBJ 里有 UV�
 |------|------|------------|
 | `MP_TOP_ANCHORS` | 17 个 MediaPipe 额头上沿锚点 | 射线起点不合理、漏掉太阳穴、整体发际线偏移 |
 | `HEAD_ARC_RADIUS_FRAC` | 矢状-arc 半径占脸高的比例 (默认 0.30) | hairline/middle 在 3D 里贴脸太紧或太靠后, 取值越小向头后弯曲越快 |
-| `UV_MIDDLE_V` | 中间行贴图 V 坐标 | 中间行采样到错误贴图位置 |
-| `UV_HAIRLINE_V` | 发际线行贴图 V 坐标 | 发际线边缘采样到错误贴图位置 |
+| `HAIRLINE_CROWN_LIFT_FRAC` | hairline 行沿 face-up 再额外外推 (默认 0.06 = 6% face_h) | 改完要 `python -m python.build_extended_obj` 重生成 `face_ext.obj`, 再 `python python/uv_template.py face_ext.obj --out imgs/uv_template.png` 刷底图 |
+| `UV_MIDDLE_DV` | 中间行 V 相对 anchor V 的偏移 | 中间行贴图采样错位 |
+| `UV_HAIRLINE_DV` | 发际线行 V 相对 anchor V 的偏移 | 发际线边缘采样错位; 注意 `anchor.V_max + Δh ≤ 1.0` |
 | `fallback_extrapolation` | 射线找不到头发时的外推距离 | 秃头、头顶出框、分割失败时回退点太高或太低 |
 
 改了 mesh 相关常量后，需要重新生成 `face_ext.obj` 并同步 SDK 常量。
