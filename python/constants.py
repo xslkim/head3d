@@ -63,6 +63,19 @@ HEAD_ARC_RADIUS_FRAC = 0.30
 HAIRLINE_CROWN_LIFT_FRAC = 0.06
 
 
+# Pure-geometry hairline offset for the /preview 502-point pipeline.
+#
+# When placing the hairline row WITHOUT hair detection (works for bald /
+# with-hair / hat — all head types), each anchor is offset upward along
+# face-up by  GEOMETRIC_HAIRLINE_OFFSET_FRAC × face_h  in normalised
+# image space. The sagittal-arc model then derives Z.
+#
+# 0.25 × face_h ≈ 0.12 normalised on a typical face (face_h ≈ 0.48),
+# giving  dz ≈ 0.05  — matches the real hairline distance observed on
+# reference photos where hair detection succeeds.
+GEOMETRIC_HAIRLINE_OFFSET_FRAC = 0.25
+
+
 # UV layout for the 34 forehead-extension vertices.
 #
 # The texture (imgs/texture0.png, 512×512) is laid out with the original

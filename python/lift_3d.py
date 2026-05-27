@@ -81,21 +81,44 @@ def build_middle_row(
     hairline_3d: np.ndarray,
     bias: float = 0.5,
 ) -> np.ndarray:
-    """Interpolate (x, y) between each MP anchor and its hairline point,
-    then re-solve z on the same circular-arc model so the middle vertex
-    lies on the head surface (not floating in front of it).
+    """Place the middle row at the arc-length midpoint between each MP
+    anchor and its hairline point.
+
+    The old approach used bias=0.5 linear interpolation in XY and then
+    independently recomputed Z via the arc formula.  Because dz ∝ dy²,
+    the middle row only received 25 % of the hairline Z offset, creating
+    a visible dent where the extension met the face mesh.
+
+    New approach: for each anchor→hairline pair, parameterise the
+    sagittal circular arc by the angle θ and place the middle vertex at
+    θ_mid = bias × θ_hair.  This distributes both the Y displacement
+    **and** the Z displacement smoothly along the arc, so the surface
+    transitions from the face mesh through middle to hairline without
+    any concavity.
     """
     R = C.HEAD_ARC_RADIUS_FRAC * _face_height(landmarks_norm)
     out = np.zeros((C.N_ANCHORS, 3), dtype=np.float32)
     for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
         a = landmarks_norm[mp_idx]
         h = hairline_3d[i]
-        x_m = (1 - bias) * float(a[0]) + bias * float(h[0])
-        y_m = (1 - bias) * float(a[1]) + bias * float(h[1])
-        dy = y_m - float(a[1])
-        out[i, 0] = x_m
-        out[i, 1] = y_m
-        out[i, 2] = float(a[2]) + _arc_dz(dy, R)
+        # X: simple linear interpolation (no arc model in the coronal plane)
+        out[i, 0] = (1 - bias) * float(a[0]) + bias * float(h[0])
+        # Y, Z: interpolate along the circular arc in the sagittal plane.
+        # The arc angle for the hairline point:
+        #   θ_h = |dy_h| / R   (small-angle: arc-length ≈ R θ)
+        # Middle sits at θ_m = bias × θ_h, giving:
+        #   dy_m = R sin(θ_m) ≈ R θ_m   for small θ
+        #   dz_m = R (1 − cos(θ_m))
+        # For the parabolic regime (θ < 0.8 rad ≈ 46°) these simplify to
+        # the same formula but we use the full trig for correctness.
+        dy_h = float(h[1]) - float(a[1])          # negative (upward)
+        sign = -1.0 if dy_h < 0 else 1.0
+        theta_h = abs(dy_h) / max(R, 1e-9)
+        theta_m = bias * theta_h
+        dy_m = sign * R * np.sin(theta_m)          # same sign as dy_h
+        dz_m = R * (1.0 - np.cos(theta_m))         # always ≥ 0
+        out[i, 1] = float(a[1]) + dy_m
+        out[i, 2] = float(a[2]) + dz_m
     return out
 
 

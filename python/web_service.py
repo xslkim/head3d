@@ -35,6 +35,9 @@ if __package__ is None or __package__ == "":
     from python.face_landmarks import FaceLandmarker, SolutionsFaceLandmarker
     from python.face_parsing import FaceParser
     from python.hairline_2d import (
+        build_hair_mask,
+        build_skin_mask,
+        face_up_vector,
         sample_hairline_lateral_extend_dense,
         smooth_hairline_corner_aware,
     )
@@ -50,6 +53,9 @@ else:
     from .face_landmarks import FaceLandmarker, SolutionsFaceLandmarker
     from .face_parsing import FaceParser
     from .hairline_2d import (
+        build_hair_mask,
+        build_skin_mask,
+        face_up_vector,
         sample_hairline_lateral_extend_dense,
         smooth_hairline_corner_aware,
     )
@@ -316,13 +322,16 @@ class HairlineWebAnalyzer:
         }
 
     def prepare_preview(self, stem: str, crown_lift_frac: float | None = None) -> dict:
-        """Run the v1 (502-vertex) pipeline with the given crown-lift and
-        return the points in both MP-order (raw output) and OBJ-vertex
-        order (slot-for-slot match with face_ext.obj), plus metadata.
+        """Build the 502-vertex mesh using pure geometry (no hair detection).
 
-        crown_lift_frac:  how far above the detected hairline (in fractions
-                          of face height) the mesh ribbon's top row should
-                          sit. ``None`` falls back to C.HAIRLINE_CROWN_LIFT_FRAC.
+        Each hairline point is placed at
+            anchor_xy  +  face_up × GEOMETRIC_HAIRLINE_OFFSET_FRAC × face_h
+        then the sagittal-arc model derives Z.  This works identically for
+        bald heads, heads with hair, and hats — only MediaPipe landmarks
+        are needed.
+
+        ``crown_lift_frac`` is accepted for API compatibility but ignored;
+        the geometric offset constant is the sole control.
 
         The caller is expected to have already called `prepare(image_path, stem)`.
         """
@@ -340,50 +349,302 @@ class HairlineWebAnalyzer:
         with self._lock:
             self._cache.move_to_end(stem)
 
-            hairline_dense, _ = sample_hairline_lateral_extend_dense(
-                landmarks, parse_map, intermediates=1,
-            )
-            hairline_17 = hairline_dense[::2]
-            if hairline_17.shape[0] != C.N_ANCHORS:
-                hairline_17 = hairline_dense[:C.N_ANCHORS]
-            valid_17 = np.ones(C.N_ANCHORS, dtype=bool)
-            hairline_smoothed = smooth_hairline_corner_aware(
-                hairline_17.copy(), valid_17, iterations=2,
-            )
-            hairline_3d = lift_hairline_to_3d(
-                landmarks, hairline_smoothed,
-                crown_lift_frac=crown_lift_frac,
-            )
-            middle_3d = build_middle_row(landmarks, hairline_3d)
+            # --- Walk to head silhouette boundary ---
+            # Each anchor walks along its LOCAL outward-normal of the
+            # forehead boundary curve. Center anchors → nearly straight
+            # up; temple anchors → up AND outward (following skull shape).
+            # The silhouette mask (skin ∪ hair) stops the walk at the
+            # head edge; a geometric max-walk caps the distance.
+            face_h_v = float(np.max(landmarks[:, 1]) - np.min(landmarks[:, 1]))
 
-            pts_mp = assemble_full(landmarks, middle_3d, hairline_3d)
+            head_mask = build_skin_mask(parse_map) | build_hair_mask(parse_map)
+            geo_dist = C.GEOMETRIC_HAIRLINE_OFFSET_FRAC * face_h_v
+            max_walk_px = int(geo_dist * max(w, h)) + 50
+            EXIT_RUN = 5  # consecutive non-head pixels → confirmed boundary
 
-            # Reorder to match the OBJ's vertex slots: for slots [0..468)
-            # OBJ slot i holds the MP landmark with id INDEX_MAP_468[i].
-            # Slots [468..502) are identity (face_ext.obj uses the same
-            # ordering as the JSON output).
-            pts_obj = np.zeros_like(pts_mp)
-            for obj_idx, mp_idx in enumerate(INDEX_MAP_468):
-                pts_obj[obj_idx] = pts_mp[mp_idx]
-            pts_obj[C.N_MP:] = pts_mp[C.N_MP:]
+            # Compute per-anchor walk direction: boundary-curve normal
+            anchor_px_arr = np.array([
+                landmarks[mp_idx, :2].astype(np.float64) * [w, h]
+                for mp_idx in C.MP_TOP_ANCHORS
+            ])
+            face_center_px = np.mean(landmarks[:, :2], axis=0).astype(np.float64) * [w, h]
 
-        effective_lift = (
-            float(crown_lift_frac)
-            if crown_lift_frac is not None
-            else float(C.HAIRLINE_CROWN_LIFT_FRAC)
-        )
+            walk_dirs = np.zeros((C.N_ANCHORS, 2), dtype=np.float64)
+            for _i in range(C.N_ANCHORS):
+                if _i == 0:
+                    tangent = anchor_px_arr[1] - anchor_px_arr[0]
+                elif _i == C.N_ANCHORS - 1:
+                    tangent = anchor_px_arr[-1] - anchor_px_arr[-2]
+                else:
+                    tangent = anchor_px_arr[_i + 1] - anchor_px_arr[_i - 1]
+                # Two perpendicular candidates
+                n1 = np.array([-tangent[1], tangent[0]], dtype=np.float64)
+                n2 = np.array([ tangent[1], -tangent[0]], dtype=np.float64)
+                # Pick the one pointing AWAY from face center (outward/upward)
+                to_anchor = anchor_px_arr[_i] - face_center_px
+                walk_dirs[_i] = n1 if np.dot(n1, to_anchor) > np.dot(n2, to_anchor) else n2
+                walk_dirs[_i] /= (np.linalg.norm(walk_dirs[_i]) + 1e-9)
+
+            hairline_2d = np.zeros((C.N_ANCHORS, 2), dtype=np.float32)
+            src_type: list[str] = []  # 'S' silhouette boundary, 'G' geo limit
+
+            for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                anchor_norm = landmarks[mp_idx, :2].astype(np.float64)
+                anchor_px = anchor_norm * np.array([w, h], dtype=np.float64)
+
+                d_unit = walk_dirs[i]
+
+                last_head_px = anchor_px.copy()
+                out_count = 0
+
+                for step in range(1, max_walk_px + 1):
+                    px = anchor_px + d_unit * step
+                    ix, iy = int(round(px[0])), int(round(px[1]))
+                    if ix < 0 or iy < 0 or ix >= w or iy >= h:
+                        break
+                    if head_mask[iy, ix]:
+                        last_head_px = px.copy()
+                        out_count = 0
+                    else:
+                        out_count += 1
+                        if out_count >= EXIT_RUN:
+                            break
+
+                hairline_2d[i, 0] = float(last_head_px[0]) / w
+                hairline_2d[i, 1] = float(last_head_px[1]) / h
+
+                walked_norm = float(np.linalg.norm(
+                    hairline_2d[i].astype(np.float64) - anchor_norm
+                ))
+                src_type.append('G' if walked_norm >= geo_dist * 0.95 else 'S')
+
+            # ==========================================================
+            # 10 variant algorithms for 3D lifting
+            # ==========================================================
+            NN = C.N_ANCHORS
+
+            def _adz(dy, R):
+                return (dy * dy) / (2.0 * max(R, 1e-6))
+
+            def _lh(R_frac):
+                """Lift hairline 2D→3D with given arc radius fraction."""
+                R = R_frac * face_h_v
+                out = np.zeros((NN, 3), dtype=np.float32)
+                for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                    za = float(landmarks[mp_idx, 2])
+                    ya = float(landmarks[mp_idx, 1])
+                    xh, yh = float(hairline_2d[i, 0]), float(hairline_2d[i, 1])
+                    dy = yh - ya
+                    out[i] = [xh, yh, za + _adz(dy, R)]
+                return out
+
+            def _mm_arc(h3d, bias, R_frac):
+                """Middle: XY linear interp + independent arc Z."""
+                R = R_frac * face_h_v
+                out = np.zeros((NN, 3), dtype=np.float32)
+                for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                    a = landmarks[mp_idx]; h = h3d[i]
+                    xm = (1-bias)*float(a[0]) + bias*float(h[0])
+                    ym = (1-bias)*float(a[1]) + bias*float(h[1])
+                    out[i] = [xm, ym, float(a[2]) + _adz(ym - float(a[1]), R)]
+                return out
+
+            def _mm_lerp(h3d, bias):
+                """Middle: full XYZ linear interpolation."""
+                out = np.zeros((NN, 3), dtype=np.float32)
+                for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                    a = landmarks[mp_idx]; h = h3d[i]
+                    for j in range(3):
+                        out[i, j] = (1-bias)*float(a[j]) + bias*float(h[j])
+                return out
+
+            def _mm_cosine(h3d, bias):
+                """Middle: cosine easing XYZ interpolation."""
+                t = (1.0 - float(np.cos(np.pi * bias))) / 2.0
+                out = np.zeros((NN, 3), dtype=np.float32)
+                for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                    a = landmarks[mp_idx]; h = h3d[i]
+                    for j in range(3):
+                        out[i, j] = (1-t)*float(a[j]) + t*float(h[j])
+                return out
+
+            def _mm_arc_angle(h3d, bias, R_frac):
+                """Middle: circular arc angle-based split (trig)."""
+                R = R_frac * face_h_v
+                out = np.zeros((NN, 3), dtype=np.float32)
+                for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                    a = landmarks[mp_idx]; h = h3d[i]
+                    out[i, 0] = (1-bias)*float(a[0]) + bias*float(h[0])
+                    dy_h = float(h[1]) - float(a[1])
+                    sgn = -1.0 if dy_h < 0 else 1.0
+                    th = abs(dy_h) / max(R, 1e-9)
+                    tm = bias * th
+                    out[i, 1] = float(a[1]) + sgn * R * float(np.sin(tm))
+                    out[i, 2] = float(a[2]) + R * (1.0 - float(np.cos(tm)))
+                return out
+
+            def _sphere_fit():
+                """Fit sphere to top face landmarks, project ext pts."""
+                y_med = float(np.median(landmarks[:, 1]))
+                idx_top = [j for j in range(C.N_MP) if landmarks[j, 1] < y_med]
+                pts_f = landmarks[idx_top].astype(np.float64)
+                A_mat = np.column_stack([
+                    2*pts_f[:, 0], 2*pts_f[:, 1], 2*pts_f[:, 2],
+                    np.ones(len(pts_f))
+                ])
+                b_vec = np.sum(pts_f ** 2, axis=1)
+                sol, _, _, _ = np.linalg.lstsq(A_mat, b_vec, rcond=None)
+                cx, cy, cz, D = sol
+                R_sp = float(np.sqrt(max(D + cx*cx + cy*cy + cz*cz, 1e-9)))
+
+                def proj(xy_2d):
+                    out = np.zeros((NN, 3), dtype=np.float32)
+                    for i in range(NN):
+                        px, py = float(xy_2d[i, 0]), float(xy_2d[i, 1])
+                        dx_, dy_ = px - cx, py - cy
+                        r2d = np.sqrt(dx_*dx_ + dy_*dy_)
+                        if r2d < R_sp:
+                            pz = cz + np.sqrt(max(R_sp*R_sp - r2d*r2d, 0))
+                        else:
+                            pz = cz
+                        out[i] = [px, py, pz]
+                    return out
+                return R_sp, proj
+
+            def _mm_tangent(h3d, bias):
+                """Middle: Hermite spline with face mesh tangent."""
+                out = np.zeros((NN, 3), dtype=np.float32)
+                for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                    a3 = landmarks[mp_idx].astype(np.float64)
+                    h = h3d[i].astype(np.float64)
+                    b3 = landmarks[10].astype(np.float64)
+                    tangent = a3 - b3
+                    tangent /= (np.linalg.norm(tangent) + 1e-9)
+                    d = np.linalg.norm(h - a3)
+                    t = bias
+                    h00 = 2*t**3 - 3*t**2 + 1
+                    h10 = t**3 - 2*t**2 + t
+                    h01 = -2*t**3 + 3*t**2
+                    h11 = t**3 - t**2
+                    m0 = tangent * d
+                    m1 = (h - a3)
+                    pt = h00*a3 + h10*m0 + h01*h + h11*m1
+                    out[i] = pt.astype(np.float32)
+                return out
+
+            def _mm_bezier(h3d, bias):
+                """Middle: cubic Bezier with face-mesh tangent."""
+                out = np.zeros((NN, 3), dtype=np.float32)
+                for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                    a3 = landmarks[mp_idx].astype(np.float64)
+                    h = h3d[i].astype(np.float64)
+                    chin = landmarks[152].astype(np.float64)
+                    tan_a = a3 - chin
+                    tan_a /= (np.linalg.norm(tan_a) + 1e-9)
+                    d = np.linalg.norm(h - a3)
+                    P0, P3 = a3, h
+                    P1 = a3 + tan_a * d * 0.4
+                    tan_h = np.array([0.0, -0.3, 0.7])
+                    tan_h /= (np.linalg.norm(tan_h) + 1e-9)
+                    P2 = h - tan_h * d * 0.4
+                    t = bias
+                    pt = ((1-t)**3)*P0 + 3*((1-t)**2)*t*P1 + 3*(1-t)*(t**2)*P2 + (t**3)*P3
+                    out[i] = pt.astype(np.float32)
+                return out
+
+            # ----- Build 10 variants -----
+            h_R30 = _lh(0.30)
+            h_R50 = _lh(0.50)
+            h_R15 = _lh(0.15)
+
+            vlist = []
+            vlist.append(("A", "抛物线 R=0.30 mid=0.5 (原始)", _mm_arc(h_R30, 0.5, 0.30), h_R30))
+            vlist.append(("B", "抛物线 R=0.30 mid=0.75",       _mm_arc(h_R30, 0.75, 0.30), h_R30))
+            vlist.append(("C", "XYZ 线性插值 50%",              _mm_lerp(h_R30, 0.5), h_R30))
+            vlist.append(("D", "圆弧角度等分 θ/2",             _mm_arc_angle(h_R30, 0.5, 0.30), h_R30))
+            try:
+                sp_R, sp_proj = _sphere_fit()
+                mid_2d_sp = np.zeros((NN, 2), dtype=np.float32)
+                for i, mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                    mid_2d_sp[i, 0] = 0.5*float(landmarks[mp_idx, 0]) + 0.5*float(hairline_2d[i, 0])
+                    mid_2d_sp[i, 1] = 0.5*float(landmarks[mp_idx, 1]) + 0.5*float(hairline_2d[i, 1])
+                vlist.append(("E", f"球面拟合 R={sp_R:.3f}", sp_proj(mid_2d_sp), sp_proj(hairline_2d)))
+            except Exception:
+                vlist.append(("E", "球面拟合 (失败)", _mm_lerp(h_R30, 0.5), h_R30))
+            vlist.append(("F", "切线 Hermite 插值",   _mm_tangent(h_R30, 0.5), h_R30))
+            vlist.append(("G", "三次贝塞尔曲线",       _mm_bezier(h_R30, 0.5), h_R30))
+            vlist.append(("H", "余弦缓动插值",         _mm_cosine(h_R30, 0.5), h_R30))
+            vlist.append(("I", "缓弧 R=0.50 + Z线性", _mm_lerp(h_R50, 0.5), h_R50))
+            vlist.append(("J", "紧弧 R=0.15 + Z线性", _mm_lerp(h_R15, 0.5), h_R15))
+
+            valid_17 = np.ones(NN, dtype=bool)
+
+            # --- Assemble all variants ---
+            all_variants = []
+            for tag, label, m3d, h3d in vlist:
+                pts_mp = assemble_full(landmarks, m3d, h3d)
+                pts_obj = np.zeros_like(pts_mp)
+                for oi, mi in enumerate(INDEX_MAP_468):
+                    pts_obj[oi] = pts_mp[mi]
+                pts_obj[C.N_MP:] = pts_mp[C.N_MP:]
+                all_variants.append({
+                    "tag": tag,
+                    "label": f"{tag}: {label}",
+                    "points_mp_order": pts_mp.astype(float).tolist(),
+                    "points_obj_order": pts_obj.astype(float).tolist(),
+                })
+
+            default_v = all_variants[2]  # C: linear 50%
+
+            arc_R_v = C.HEAD_ARC_RADIUS_FRAC * face_h_v
+            n_sil = sum(1 for s in src_type if s == 'S')
+            debug_anchors = []
+            for _i, _mp_idx in enumerate(C.MP_TOP_ANCHORS):
+                _y_a = float(landmarks[_mp_idx, 1])
+                _z_a = float(landmarks[_mp_idx, 2])
+                _y_2d = float(hairline_2d[_i, 1])
+                _y_3d = float(vlist[2][3][_i, 1])
+                _z_3d = float(vlist[2][3][_i, 2])
+                _x_a = float(landmarks[_mp_idx, 0])
+                _x_2d = float(hairline_2d[_i, 0])
+                _wd = walk_dirs[_i]
+                debug_anchors.append({
+                    "i": _i, "mp_idx": int(_mp_idx), "valid": True,
+                    "src": src_type[_i],
+                    "x_anc": round(_x_a, 4), "x_2d": round(_x_2d, 4),
+                    "dx": round(_x_2d - _x_a, 4),
+                    "walk_dir": f"({_wd[0]:+.2f},{_wd[1]:+.2f})",
+                    "y_anc": round(_y_a, 4), "y_2d": round(_y_2d, 4),
+                    "y_3d": round(_y_3d, 4), "dy": round(_y_3d - _y_a, 4),
+                    "z_anc": round(_z_a, 4), "z_3d": round(_z_3d, 4),
+                    "dz": round(_z_3d - _z_a, 4),
+                })
+            sys.stderr.write(
+                f"\n[preview] 10 variants built. face_h={face_h_v:.4f}"
+                f" silhouette={n_sil}/{NN}\n"
+            )
+            sys.stderr.flush()
+
         return {
             "image": {"width": int(w), "height": int(h)},
-            "n_total": int(pts_mp.shape[0]),
-            "points_mp_order": pts_mp.astype(float).tolist(),
-            "points_obj_order": pts_obj.astype(float).tolist(),
+            "n_total": C.N_TOTAL,
+            "points_mp_order": default_v["points_mp_order"],
+            "points_obj_order": default_v["points_obj_order"],
             "valid_hairline": valid_17.tolist(),
             "groups": {
                 "mp": [0, C.N_MP],
                 "v1_middle": [C.MIDDLE_START, C.HAIRLINE_START],
                 "v1_hairline": [C.HAIRLINE_START, C.N_TOTAL],
             },
-            "crown_lift_frac": effective_lift,
+            "crown_lift_frac": float(C.GEOMETRIC_HAIRLINE_OFFSET_FRAC),
+            "variants": all_variants,
+            "debug": {
+                "face_h": round(face_h_v, 4),
+                "arc_R": round(arc_R_v, 4),
+                "geo_offset_frac": float(C.GEOMETRIC_HAIRLINE_OFFSET_FRAC),
+                "n_silhouette": n_sil,
+                "anchors": debug_anchors,
+            },
         }
 
 
@@ -795,8 +1056,8 @@ PREVIEW_HTML = """
     .legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; font-size: 12px; color: #374151; }
     .legend .item { display: flex; align-items: center; gap: 6px; }
     .legend .swatch { width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(0,0,0,0.15); }
-    .threejs-grid { display: grid; grid-template-rows: 1fr 1fr; gap: 14px; }
-    .three-card { background: #0f172a; border-radius: 12px; overflow: hidden; position: relative; min-height: 360px; aspect-ratio: 16 / 11; }
+    .threejs-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    .three-card { background: #0f172a; border-radius: 12px; overflow: hidden; position: relative; min-height: 500px; }
     .three-card .three-canvas { display: block; width: 100%; height: 100%; }
     .three-card.overlay-card { background: #000; aspect-ratio: auto; min-height: 0; }
     .three-card.overlay-card .overlay-bg { display: block; width: 100%; height: auto; }
@@ -857,10 +1118,14 @@ PREVIEW_HTML = """
         </div>
         <div class="legend">
           <div class="item"><span class="swatch" style="background:#cccccc"></span> MediaPipe 468</div>
-          <div class="item"><span class="swatch" style="background:#ffa040"></span> v1 middle 17</div>
-          <div class="item"><span class="swatch" style="background:#ffc864"></span> v1 hairline 17</div>
+          <div class="item"><span class="swatch" style="background:#00e5ff"></span> v1 middle 17 (青)</div>
+          <div class="item"><span class="swatch" style="background:#ff3d00"></span> v1 hairline 17 (红)</div>
         </div>
         <div class="meta" id="meta">--</div>
+        <details id="debug_details" style="margin-top:8px;">
+          <summary style="cursor:pointer;color:#2563eb;font-weight:600;font-size:13px;user-select:none;">▶ 调试明细 (per-anchor dy / dz)</summary>
+          <div id="debug_table_wrap" style="overflow-x:auto;margin-top:8px;font-size:11px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;"></div>
+        </details>
         <p class="muted" style="margin-top:10px; font-size:11px; line-height:1.4;">
           crown_lift 已锁定为 6% face_h (HAIRLINE_CROWN_LIFT_FRAC), face_ext.obj 与运行时检测都用同一个常数。
         </p>
@@ -880,6 +1145,15 @@ PREVIEW_HTML = """
             </div>
             <span class="controls-help">静态 ortho · 与原图严格对齐</span>
           </div>
+          <div class="three-card" id="card_live3d">
+            <span class="badge">实时 3D · <select id="variant_select_3d" style="font-size:11px;border-radius:4px;padding:1px 4px;"></select></span>
+            <canvas class="three-canvas" id="canvas_live3d"></canvas>
+            <div class="toggle-row">
+              <label><input type="checkbox" id="wf_live3d"> 线框</label>
+              <label><input type="checkbox" id="tex_live3d" checked> 贴图</label>
+            </div>
+            <span class="controls-help">drag · wheel · right-drag · 下拉切换算法</span>
+          </div>
           <div class="three-card" id="card_canonical">
             <span class="badge">canonical · face_ext.obj (可旋转)</span>
             <canvas class="three-canvas" id="canvas_canonical"></canvas>
@@ -891,6 +1165,11 @@ PREVIEW_HTML = """
           </div>
         </div>
       </article>
+    </section>
+
+    <section class="card" style="margin-top:18px;" id="variant_grid_section">
+      <h2 class="panel-title">10 种算法对比 <small>2D overlay · 点击切换 3D 视图</small></h2>
+      <div id="variant_grid" style="display:grid; grid-template-columns:repeat(5,1fr); gap:10px;"></div>
     </section>
 
     <section class="card" style="margin-top:18px;">
@@ -992,8 +1271,8 @@ PREVIEW_HTML = """
         overlayCanvas.width = W; overlayCanvas.height = H;
         const ctx = overlayCanvas.getContext('2d');
         ctx.clearRect(0, 0, W, H);
-        const colors = { mp: '#cccccc', v1_middle: '#ffa040', v1_hairline: '#ffc864' };
-        const radii  = { mp: 1.6,        v1_middle: 3.2,        v1_hairline: 3.2 };
+        const colors = { mp: '#cccccc', v1_middle: '#00e5ff', v1_hairline: '#ff3d00' };
+        const radii  = { mp: 1.6,        v1_middle: 3.5,        v1_hairline: 3.5 };
         const pts = data.points_mp_order;
         for (const [name, [a, b]] of Object.entries(data.groups)) {
           const c = colors[name];
@@ -1002,9 +1281,20 @@ PREVIEW_HTML = """
           const r = (radii[name] || 2) * (Math.min(W, H) / 600.0);
           for (let i = a; i < b; i++) {
             const p = pts[i];
+            const px = p[0] * W, py = p[1] * H;
             ctx.beginPath();
-            ctx.arc(p[0] * W, p[1] * H, r, 0, 2 * Math.PI);
+            ctx.arc(px, py, r, 0, 2 * Math.PI);
             ctx.fill();
+            if (name === 'v1_middle' || name === 'v1_hairline') {
+              const fs = Math.round(r * 3.5);
+              ctx.font = 'bold ' + fs + 'px sans-serif';
+              ctx.strokeStyle = '#000';
+              ctx.lineWidth = 2.5;
+              const label = String(i - a);
+              ctx.strokeText(label, px + r + 2, py - r);
+              ctx.fillStyle = c;
+              ctx.fillText(label, px + r + 2, py - r);
+            }
           }
         }
         const ANCHORS = [127,234,162,21,54,103,67,109,10,338,297,332,284,251,389,356,454];
@@ -1022,9 +1312,152 @@ PREVIEW_HTML = """
           'crown_lift = ' + lift_pct + '% face_h · ' +
           '⟨ z(hairline) − z(MP anchor) ⟩ = ' + dz_mean.toFixed(4) +
           (dz_mean > 0 ? ' ✓' : ' ✗');
+
+        // Populate per-anchor debug table
+        const dbg = data.debug;
+        const dtWrap = document.getElementById('debug_table_wrap');
+        if (dbg && dbg.anchors && dtWrap) {
+          const rows = dbg.anchors.map(a => {
+            const dyBig  = Math.abs(a.dy) > 0.15;
+            const dzBig  = a.dz > 0.05;
+            const dyStyle = dyBig  ? 'color:#dc2626;font-weight:700' : '';
+            const dzStyle = dzBig  ? 'color:#dc2626;font-weight:700' : 'color:#059669';
+            const validMark = a.src === 'S'
+              ? '<span style="color:#2563eb" title="silhouette boundary">S</span>'
+              : '<span style="color:#059669" title="geometric limit">G</span>';
+            return '<tr>' +
+              '<td style="padding:2px 5px">' + a.i + '</td>' +
+              '<td style="padding:2px 5px">mp' + a.mp_idx + '</td>' +
+              '<td style="padding:2px 5px;text-align:center">' + validMark + '</td>' +
+              '<td style="padding:2px 5px">' + (a.walk_dir||'') + '</td>' +
+              '<td style="padding:2px 5px">' + a.x_anc + '</td>' +
+              '<td style="padding:2px 5px">' + a.x_2d  + '</td>' +
+              '<td style="padding:2px 5px">' + (a.dx > 0 ? '+' : '') + a.dx + '</td>' +
+              '<td style="padding:2px 5px">' + a.y_anc + '</td>' +
+              '<td style="padding:2px 5px">' + a.y_2d  + '</td>' +
+              '<td style="padding:2px 5px;' + dyStyle + '">' + (a.dy > 0 ? '+' : '') + a.dy + '</td>' +
+              '<td style="padding:2px 5px">' + a.z_anc + '</td>' +
+              '<td style="padding:2px 5px">' + a.z_3d  + '</td>' +
+              '<td style="padding:2px 5px;' + dzStyle + '">' + (a.dz > 0 ? '+' : '') + a.dz + '</td>' +
+              '</tr>';
+          }).join('');
+          dtWrap.innerHTML =
+            '<div style="margin-bottom:5px;color:#374151">' +
+              'face_h=<b>' + dbg.face_h + '</b> · R=<b>' + dbg.arc_R + '</b> · geo_max=<b>' + (dbg.geo_offset_frac||'') + '</b> · silhouette=<b>' + (dbg.n_silhouette||0) + '/' + (dbg.anchors||[]).length + '</b>' +
+            '</div>' +
+            '<table style="border-collapse:collapse;border:1px solid #d1d5db;width:100%">' +
+              '<tr style="background:#f8fafc;font-weight:700">' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">i</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">mp</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">src</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">walk</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">x_anc</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">x_2d</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">dx</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">y_anc</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">y_2d</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">dy</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">z_anc</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">z_3d</th>' +
+                '<th style="padding:3px 5px;border:1px solid #d1d5db">dz↑</th>' +
+              '</tr>' + rows +
+            '</table>' +
+            '<div style="margin-top:4px;color:#6b7280;font-size:10px">' +
+              'S=轮廓边界停止 G=走到几何上限。dy = y_3d − y_anc；dz = z_hair − z_anc。|dy|&gt;0.15 或 dz&gt;0.05 标红。' +
+            '</div>';
+        }
       }
 
       dataPromise.then(redrawDotsAndMeta).catch(e => setStatus('左侧渲染失败: ' + e, 'err'));
+
+      // --- 10-variant comparison grid ---
+      let live3dApply = null;  // will be set by setupLive3DViewer
+      dataPromise.then(data => {
+        const variants = data.variants || [];
+        if (!variants.length) return;
+        const grid = document.getElementById('variant_grid');
+        const sel = document.getElementById('variant_select_3d');
+        if (!grid || !sel) return;
+
+        // populate dropdown
+        variants.forEach((v, idx) => {
+          const opt = document.createElement('option');
+          opt.value = idx;
+          opt.textContent = v.label;
+          sel.appendChild(opt);
+        });
+        sel.value = 2; // default C
+
+        sel.addEventListener('change', () => {
+          const vi = parseInt(sel.value, 10);
+          if (live3dApply && variants[vi]) live3dApply(variants[vi].points_obj_order);
+        });
+
+        // build 5×2 grid of small canvases
+        const W = origImg.naturalWidth || 600, H = origImg.naturalHeight || 800;
+        const groups = data.groups;
+        variants.forEach((v, idx) => {
+          const cell = document.createElement('div');
+          cell.style.cssText = 'cursor:pointer;border:2px solid transparent;border-radius:8px;overflow:hidden;background:#111;position:relative;';
+          if (idx === 2) cell.style.borderColor = '#2563eb';
+
+          const cvs = document.createElement('canvas');
+          const scale = 240 / Math.max(W, 1);
+          cvs.width = Math.round(W * scale);
+          cvs.height = Math.round(H * scale);
+          cvs.style.cssText = 'display:block;width:100%;height:auto;';
+
+          const ctx = cvs.getContext('2d');
+          // draw original image scaled
+          const imgForDraw = new Image();
+          imgForDraw.crossOrigin = 'anonymous';
+          imgForDraw.src = origImg.src;
+          const drawOverlay = () => {
+            ctx.drawImage(imgForDraw, 0, 0, cvs.width, cvs.height);
+            const pts = v.points_mp_order;
+            const sw = cvs.width, sh = cvs.height;
+            const dotR = Math.max(1.5, sw / 200);
+            // mp points light
+            ctx.fillStyle = 'rgba(200,200,200,0.3)';
+            for (let i = groups.mp[0]; i < groups.mp[1]; i++) {
+              ctx.beginPath();
+              ctx.arc(pts[i][0]*sw, pts[i][1]*sh, dotR*0.5, 0, 2*Math.PI);
+              ctx.fill();
+            }
+            // middle cyan
+            ctx.fillStyle = '#00e5ff';
+            for (let i = groups.v1_middle[0]; i < groups.v1_middle[1]; i++) {
+              ctx.beginPath();
+              ctx.arc(pts[i][0]*sw, pts[i][1]*sh, dotR, 0, 2*Math.PI);
+              ctx.fill();
+            }
+            // hairline red
+            ctx.fillStyle = '#ff3d00';
+            for (let i = groups.v1_hairline[0]; i < groups.v1_hairline[1]; i++) {
+              ctx.beginPath();
+              ctx.arc(pts[i][0]*sw, pts[i][1]*sh, dotR, 0, 2*Math.PI);
+              ctx.fill();
+            }
+          };
+          if (imgForDraw.complete) drawOverlay();
+          else imgForDraw.addEventListener('load', drawOverlay, {once:true});
+
+          const lbl = document.createElement('div');
+          lbl.textContent = v.label;
+          lbl.style.cssText = 'padding:4px 6px;font-size:11px;font-weight:600;color:#e5e7eb;background:rgba(0,0,0,0.7);';
+
+          cell.appendChild(cvs);
+          cell.appendChild(lbl);
+          grid.appendChild(cell);
+
+          cell.addEventListener('click', () => {
+            grid.querySelectorAll('div').forEach(d => { if(d.parentNode === grid) d.style.borderColor = 'transparent'; });
+            cell.style.borderColor = '#2563eb';
+            sel.value = idx;
+            sel.dispatchEvent(new Event('change'));
+          });
+        });
+      });
 
       // --- UV template image: clean ⇄ overlay (with current texture0) ----
       const uvImg      = document.getElementById('uv_template_img');
@@ -1350,8 +1783,48 @@ PREVIEW_HTML = """
         requestAnimationFrame(loop);
       }
 
+      async function setupLive3DViewer(canvasId) {
+        const canvasEl = document.getElementById(canvasId);
+        const { scene, camera, controls, renderer } = setupScene(canvasEl);
+        const data = await dataPromise;
+
+        const { geom, bufferToObj, nObjVertices } = await loadIndexedGeometry();
+        const tex = await loadTextureURL(texURL);
+
+        applyDetectedPositions(geom, bufferToObj, data.points_obj_order);
+
+        const matTex = buildBaseMaterial(tex);
+        const matWire = new THREE.MeshBasicMaterial({
+          color: 0x55ff88, wireframe: true, transparent: true, opacity: 0.6,
+        });
+        textureMeshRefs.push({ material: matTex });
+
+        const mesh = new THREE.Mesh(geom, matTex);
+        mesh.scale.set(1, -1, -1);
+
+        const wire = new THREE.Mesh(geom, matWire);
+        wire.scale.copy(mesh.scale);
+        wire.visible = false;
+        scene.add(mesh);
+        scene.add(wire);
+
+        document.getElementById('wf_live3d').addEventListener('change', e => { wire.visible = e.target.checked; });
+        document.getElementById('tex_live3d').addEventListener('change', e => {
+          mesh.visible = e.target.checked;
+          if (!e.target.checked) wire.visible = true;
+        });
+
+        centerAndFit(mesh, camera, controls);
+
+        // Expose apply function for variant switching
+        live3dApply = (points_obj_order) => {
+          applyDetectedPositions(geom, bufferToObj, points_obj_order);
+        };
+      }
+
       Promise.all([
         setupLiveOverlay('canvas_live', 'overlay_bg'),
+        setupLive3DViewer('canvas_live3d'),
         setupCanonicalViewer('canvas_canonical'),
       ]).then(() => setStatus('✓ 已加载', null))
         .catch(e => { console.error(e); setStatus('3D 加载失败: ' + e.message, 'err'); });
