@@ -271,6 +271,20 @@ class HairlineWebAnalyzer:
                     landmarks = self._detect_landmarks_inproc(np.ascontiguousarray(rgb))
                 if landmarks is None:
                     raise RuntimeError("没有检测到人脸, 请换一张正脸或光线更清楚的图片。")
+                # Check face area ratio — reject if face is too small
+                H_img, W_img = rgb.shape[:2]
+                face_x_min = float(landmarks[:, 0].min())
+                face_x_max = float(landmarks[:, 0].max())
+                face_y_min = float(landmarks[:, 1].min())
+                face_y_max = float(landmarks[:, 1].max())
+                face_area = (face_x_max - face_x_min) * W_img * (face_y_max - face_y_min) * H_img
+                image_area = W_img * H_img
+                if face_area < image_area * 0.08:
+                    pct = face_area / image_area * 100
+                    raise RuntimeError(
+                        f"人脸占比太小：人脸面积仅占图片的 {pct:.1f}%（要求 ≥ 8%）。"
+                        f"请裁剪图片或更换人脸更大的照片。"
+                    )
             entry = {
                 "rgb": rgb,
                 "parse_map": parse_map,
@@ -831,10 +845,29 @@ INDEX_HTML = """
       </div>
       <h1>发际线分析 · lateral_extend_dense 实时调参</h1>
       <p class="muted">上传一张正脸照片后, 在左侧滑块上调整任何参数都会立即重新渲染发际线 (parse map + landmarks 只在上传时跑一次)。</p>
-      <form action="/hairline/analyze" method="post" enctype="multipart/form-data">
+      <form id="upload_form" action="/hairline/analyze" method="post" enctype="multipart/form-data">
         <input type="file" name="image" accept="image/png,image/jpeg,image/webp" required>
         <button class="primary" type="submit">上传 / 开始分析</button>
       </form>
+      <script>
+      document.getElementById('upload_form').addEventListener('submit', function(e) {
+        var fileInput = this.querySelector('input[type=file]');
+        if (!fileInput.files || !fileInput.files[0]) return;
+        e.preventDefault();
+        var file = fileInput.files[0];
+        var img = new Image();
+        img.onload = function() {
+          URL.revokeObjectURL(img.src);
+          if (img.naturalWidth < 1024 || img.naturalHeight < 1024) {
+            alert('图片分辨率不足：当前 ' + img.naturalWidth + '×' + img.naturalHeight + '，要求宽和高都 ≥ 1024 像素，请更换更高分辨率的图片。');
+            return;
+          }
+          e.target.submit();
+        };
+        img.onerror = function() { URL.revokeObjectURL(img.src); e.target.submit(); };
+        img.src = URL.createObjectURL(file);
+      });
+      </script>
       {% if error %}
       <div class="error">{{ error }}</div>
       {% endif %}
@@ -1101,10 +1134,29 @@ PREVIEW_HTML = """
       </div>
       <h1>v1 hairline mesh · 端到端 3D 验证 <span class="status" id="hero_status"></span></h1>
       <p class="muted">上传一张正脸照, 左侧画 3 组识别点 (MP 468 + v1 middle 17 + v1 hairline 17 = 502), 右上是 ortho 正交投影 = 原图为底 + 活脸 mesh 贴图 overlay (与原图严格对齐), 右下是 OBJ 文件里的标准模板 mesh (可旋转). 新加的 middle / hairline 行 z 用矢状-arc 公式 z = z_anchor + dy²/(2R) 反解, 始终向头后方向偏, 严格落在头骨曲面上.</p>
-      <form action="/preview/analyze" method="post" enctype="multipart/form-data">
+      <form id="preview_upload_form" action="/preview/analyze" method="post" enctype="multipart/form-data">
         <input type="file" name="image" accept="image/png,image/jpeg,image/webp" required>
         <button class="primary" type="submit">上传 / 开始分析</button>
       </form>
+      <script>
+      document.getElementById('preview_upload_form').addEventListener('submit', function(e) {
+        var fileInput = this.querySelector('input[type=file]');
+        if (!fileInput.files || !fileInput.files[0]) return;
+        e.preventDefault();
+        var file = fileInput.files[0];
+        var img = new Image();
+        img.onload = function() {
+          URL.revokeObjectURL(img.src);
+          if (img.naturalWidth < 1024 || img.naturalHeight < 1024) {
+            alert('图片分辨率不足：当前 ' + img.naturalWidth + '×' + img.naturalHeight + '，要求宽和高都 ≥ 1024 像素，请更换更高分辨率的图片。');
+            return;
+          }
+          e.target.submit();
+        };
+        img.onerror = function() { URL.revokeObjectURL(img.src); e.target.submit(); };
+        img.src = URL.createObjectURL(file);
+      });
+      </script>
       {% if error %}<div class="error">{{ error }}</div>{% endif %}
     </section>
 
