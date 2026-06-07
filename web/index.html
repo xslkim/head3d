@@ -15,7 +15,9 @@
   .panel { background: #23262d; border: 1px solid #333; border-radius: 8px; padding: 14px; }
   .panel h2 { margin: 0 0 10px; font-size: 13px; color: #9aa; text-transform: uppercase; letter-spacing: .04em; }
   label.file { display: block; padding: 10px; text-align: center; background: #2f7d5b; border-radius: 6px; cursor: pointer; font-weight: 600; }
+  label.file.alt { background: #3a567d; }
   label.file input { display: none; }
+  img.ref { width: 100%; border-radius: 6px; border: 1px solid #3a3f48; display: block; background: #fff; cursor: zoom-in; margin-bottom: 8px; }
   .slider { margin: 16px 0; }
   .slider .row { display: flex; justify-content: space-between; margin-bottom: 4px; }
   .slider .val { color: #7fd; font-variant-numeric: tabular-nums; }
@@ -50,6 +52,15 @@
     <h2 style="margin-top:22px">2 · 算法（已固定）</h2>
     <p class="hint">9 组锚点 [a,b] 从外侧点 b 沿 b−a 方向生成 3 个点（0.8 / 1.5 / 2.2 ×A），共 27 点。<br><br>
       贴合算法：<b>抛物后收</b> —— 保持 x/y 为线性外推，深度 z 按距离² 平滑后退，后收强度 <b>0.20</b>。所有参数已固定。</p>
+
+    <h2 style="margin-top:22px">3 · 效果贴图</h2>
+    <a href="/uv_reference" target="_blank" title="点击查看大图（与 texture0.png 像素对齐）">
+      <img id="uvref" class="ref" src="/uv_reference" alt="UV 参考图" />
+    </a>
+    <p class="hint" style="margin:0 0 10px">参考上图顶部绿色圆弧区设计头顶贴图，画布尺寸与 texture0.png 一致。</p>
+    <label class="file alt">上传效果贴图
+      <input id="texfile" type="file" accept="image/*" />
+    </label>
   </div>
 
   <div class="panel view">
@@ -96,8 +107,12 @@ const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
 camera.position.set(0, 0, 600);
 const controls = new OrbitControls(camera, canvas);
 scene.add(new THREE.AmbientLight(0xffffff, 1.0));
-const texture = new THREE.TextureLoader().load('/texture');
-texture.colorSpace = THREE.SRGBColorSpace;
+function makeTexture(url) {
+  const t = new THREE.TextureLoader().load(url);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+let texture = makeTexture('/texture');
 let meshGroup = null;
 let wireframes = [];   // LineSegments overlays for the 3D view
 let objText = null;    // raw OBJ text, reused for the 2D wireframe
@@ -211,7 +226,23 @@ async function upload(file) {
   setStatus('完成', true);
 }
 
+async function uploadTexture(file) {
+  if (!session) { setStatus('请先上传人脸照片'); return; }
+  setStatus('应用效果贴图中…', true);
+  const fd = new FormData();
+  fd.append('image', file); fd.append('session', session);
+  const r = await fetch('/custom_texture', { method: 'POST', body: fd });
+  const j = await r.json();
+  if (!r.ok) { setStatus(j.error || '贴图上传失败'); return; }
+  // refresh the 3D texture (cache-busted) then rebuild with the new overlay/obj
+  texture = makeTexture('/texture?session=' + session + '&_=' + Date.now());
+  $('overlay').src = j.overlay;
+  loadObj(j.obj);
+  setStatus('效果贴图已应用', true);
+}
+
 $('file').addEventListener('change', e => { if (e.target.files[0]) upload(e.target.files[0]); });
+$('texfile').addEventListener('change', e => { if (e.target.files[0]) uploadTexture(e.target.files[0]); });
 $('wire2d').addEventListener('change', drawWire2d);
 $('wire3d').addEventListener('change', e => setWire3d(e.target.checked));
 $('overlay').addEventListener('load', drawWire2d);

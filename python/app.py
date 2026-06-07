@@ -1,11 +1,12 @@
 """Flask web service: upload a face photo, extend the mesh, preview live.
 
 Pipeline per docs/新算法.md:
-  upload -> detect 468 landmarks -> deform 486-vertex mesh -> 2D overlay
-  sliders (t1/t2) -> recompute extension -> re-render overlay + 3D obj
+  upload -> detect 468 landmarks -> deform 495-vertex mesh -> 2D overlay + 3D obj
 
-The 2D overlay is rendered server-side (CPU). The 3D view is the same
-deformed OBJ streamed to a three.js viewer in the browser.
+Extension parameters are fixed (27 points, parabolic depth refine). The artist
+can upload a custom effect texture (POST /custom_texture) designed against the
+UV reference image (GET /uv_reference); it is stored per session and used for
+both the server-side 2D overlay and the three.js 3D view (GET /texture).
 """
 from __future__ import annotations
 
@@ -60,8 +61,11 @@ def _build(session: dict) -> dict:
     """Deform + render; return overlay + obj payload (parameters are fixed)."""
     positions = deform_positions(session["landmarks_px"])
 
+    tex = session.get("texture_rgba")
+    if tex is None:
+        tex = TEXTURE
     overlay = render_overlay(
-        session["photo_rgb"], positions, TPL_TEXCOORDS, TPL_FACES, TEXTURE, alpha=1.0
+        session["photo_rgb"], positions, TPL_TEXCOORDS, TPL_FACES, tex, alpha=1.0
     )
 
     mesh = ObjMesh()
@@ -81,7 +85,49 @@ def index():
 
 @app.route("/texture")
 def texture():
+    """Serve the session's custom texture if uploaded, else the default."""
+    sid = request.args.get("session")
+    session = SESSIONS.get(sid) if sid else None
+    if session is not None and session.get("texture_png") is not None:
+        return send_file(io.BytesIO(session["texture_png"]), mimetype="image/png")
     return send_file(TEX_PATH, mimetype="image/png")
+
+
+@app.route("/uv_reference")
+def uv_reference():
+    """Serve the UV reference image for designing custom textures."""
+    path = os.path.join(ROOT, "imgs", "uv_reference.png")
+    if not os.path.isfile(path):
+        return jsonify({"error": "uv_reference.png not found, run make_uv_reference.py"}), 404
+    return send_file(path, mimetype="image/png")
+
+
+@app.route("/custom_texture", methods=["POST"])
+def custom_texture():
+    """Upload a custom effect texture; re-render the overlay for the session."""
+    sid = request.form.get("session")
+    session = SESSIONS.get(sid)
+    if session is None:
+        return jsonify({"error": "unknown session"}), 404
+    file = request.files.get("image")
+    if file is None:
+        return jsonify({"error": "no image"}), 400
+    raw = file.read()
+    bgra = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_UNCHANGED)
+    if bgra is None:
+        return jsonify({"error": "bad image"}), 400
+    # Normalize to RGBA (texture may be RGB or RGBA / grayscale).
+    if bgra.ndim == 2:
+        rgba = cv2.cvtColor(bgra, cv2.COLOR_GRAY2RGBA)
+    elif bgra.shape[2] == 3:
+        rgba = cv2.cvtColor(bgra, cv2.COLOR_BGR2RGBA)
+    else:
+        rgba = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
+    session["texture_rgba"] = rgba
+    # Re-encode to PNG so the 3D viewer can fetch it via GET /texture.
+    ok, buf = cv2.imencode(".png", cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
+    session["texture_png"] = buf.tobytes() if ok else raw
+    return jsonify(_build(session))
 
 
 @app.route("/upload", methods=["POST"])
