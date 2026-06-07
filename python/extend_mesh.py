@@ -97,6 +97,13 @@ def ribbon_faces(n_base: int) -> list[tuple[int, int, int]]:
             h0, h1 = hi[j], hi[j + 1]
             faces.append((l0, l1, h1))
             faces.append((l0, h1, h0))
+
+    # Two corner fill triangles closing the outer gaps (user-specified winding):
+    #   (54, group[68,54] ring0 point, 21)   left side
+    #   (284, group[298,284] ring0 point, 251) right side
+    ring0 = rings[0]
+    faces.append((_MP_TO_OBJ[54], ring0[0], _MP_TO_OBJ[21]))
+    faces.append((_MP_TO_OBJ[284], ring0[N_PAIRS - 1], _MP_TO_OBJ[251]))
     return faces
 
 

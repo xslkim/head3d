@@ -35,7 +35,7 @@ def main() -> None:
     ext = extend_obj_mesh(base, tuple(args.t))
     print(f"ext : v={ext.n_v()} vt={ext.n_vt()} vn={ext.n_vn()} f={ext.n_f()}")
 
-    n_ribbon = N_RINGS * (N_PAIRS - 1) * 2        # 3 strips * 8 quads * 2 = 48
+    n_ribbon = N_RINGS * (N_PAIRS - 1) * 2 + 2    # 3 strips*8 quads*2 + 2 corners
     assert ext.n_v() == base.n_v() + N_NEW, "vertex count mismatch"
     assert ext.n_f() == base.n_f() + n_ribbon, f"expected {n_ribbon} new faces"
 
