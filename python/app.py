@@ -23,7 +23,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from python.deform import deform_positions
-from python.extend_mesh import T1_DEFAULT, T2_DEFAULT
+from python.extend_mesh import T_DEFAULT
+from python.refine import ALGO_LABELS, ALGOS, PARAM_SPECS, default_params
 from python.landmarks import FaceLandmarker, to_pixels
 from python.obj_io import ObjMesh, dumps_obj, read_obj
 from python.render2d import render_overlay
@@ -57,9 +58,9 @@ def _png_data_uri(rgb: np.ndarray) -> str:
     return "data:image/png;base64," + b64
 
 
-def _build(session: dict, t1: float, t2: float) -> dict:
+def _build(session: dict, t: tuple[float, ...], algo: str, params: dict) -> dict:
     """Deform + render for the given sliders; return overlay + obj payload."""
-    positions = deform_positions(session["landmarks_px"], t1, t2)
+    positions = deform_positions(session["landmarks_px"], t, algo, params)
 
     overlay = render_overlay(
         session["photo_rgb"], positions, TPL_TEXCOORDS, TPL_FACES, TEXTURE, alpha=1.0
@@ -73,6 +74,28 @@ def _build(session: dict, t1: float, t2: float) -> dict:
     obj_text = dumps_obj(mesh, header=["# deformed head mesh"])
 
     return {"overlay": _png_data_uri(overlay), "obj": obj_text}
+
+
+def _algo_meta() -> dict:
+    """Static description of the 6 refinement algorithms for the web UI."""
+    return {
+        "algos": ALGOS,
+        "labels": ALGO_LABELS,
+        "params": PARAM_SPECS,
+        "t_default": list(T_DEFAULT),
+    }
+
+
+def _parse_controls(body: dict) -> tuple[tuple[float, ...], str, dict]:
+    """Pull (t, algo, params) out of a JSON body, falling back to defaults."""
+    t = body.get("t") or list(T_DEFAULT)
+    t = tuple(float(x) for x in t)
+    algo = body.get("algo", "linear")
+    if algo not in ALGOS:
+        algo = "linear"
+    params = {**default_params(algo), **(body.get("params") or {})}
+    params = {k: float(v) for k, v in params.items()}
+    return t, algo, params
 
 
 @app.route("/")
@@ -108,15 +131,14 @@ def upload():
         "w": w,
         "h": h,
     }
-    payload = _build(SESSIONS[sid], T1_DEFAULT, T2_DEFAULT)
+    payload = _build(SESSIONS[sid], T_DEFAULT, "linear", default_params("linear"))
     payload.update(
         {
             "session": sid,
             "width": w,
             "height": h,
             "photo": _png_data_uri(rgb),
-            "t1": T1_DEFAULT,
-            "t2": T2_DEFAULT,
+            "meta": _algo_meta(),
         }
     )
     return jsonify(payload)
@@ -129,9 +151,8 @@ def update():
     session = SESSIONS.get(sid)
     if session is None:
         return jsonify({"error": "unknown session"}), 404
-    t1 = float(body.get("t1", T1_DEFAULT))
-    t2 = float(body.get("t2", T2_DEFAULT))
-    return jsonify(_build(session, t1, t2))
+    t, algo, params = _parse_controls(body)
+    return jsonify(_build(session, t, algo, params))
 
 
 def main() -> None:

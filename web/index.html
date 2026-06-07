@@ -26,6 +26,7 @@
   .status { margin-top: 8px; min-height: 18px; color: #f99; }
   .hint { color: #889; font-size: 12px; }
   button.reset { width: 100%; margin-top: 6px; padding: 7px; background: #3a3f48; color: #ddd; border: 1px solid #4a4f58; border-radius: 6px; cursor: pointer; }
+  select#algo { width: 100%; padding: 7px; background: #2f333b; color: #e6e6e6; border: 1px solid #4a4f58; border-radius: 6px; cursor: pointer; }
   .toolbar { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
   label.chk { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: #bcd; user-select: none; }
   label.chk input { accent-color: #2f7d5b; }
@@ -47,17 +48,27 @@
     </label>
     <div class="status" id="status"></div>
 
-    <h2 style="margin-top:22px">2 · 扩展参数</h2>
+    <h2 style="margin-top:22px">2 · 扩展环长 (×A)</h2>
     <div class="slider">
-      <div class="row"><span>t1 (内环 · 0.8A)</span><span class="val" id="t1v">0.80</span></div>
-      <input id="t1" type="range" min="0" max="2" step="0.05" value="0.8" />
+      <div class="row"><span>t1 · 内环</span><span class="val" id="t0v">0.80</span></div>
+      <input id="t0" type="range" min="0" max="3" step="0.05" value="0.8" />
     </div>
     <div class="slider">
-      <div class="row"><span>t2 (外环 · 1.6A)</span><span class="val" id="t2v">1.60</span></div>
-      <input id="t2" type="range" min="0" max="3" step="0.05" value="1.6" />
+      <div class="row"><span>t2 · 中环</span><span class="val" id="t1v">1.50</span></div>
+      <input id="t1" type="range" min="0" max="3" step="0.05" value="1.5" />
     </div>
-    <button class="reset" id="reset">恢复默认 (0.8 / 1.6)</button>
-    <p class="hint" style="margin-top:18px">每组锚点 [a,b] 从外侧点 b 沿 b−a 方向生成两点：<br>b+t1·(b−a)、b+t2·(b−a)。</p>
+    <div class="slider">
+      <div class="row"><span>t3 · 外环</span><span class="val" id="t2v">2.20</span></div>
+      <input id="t2" type="range" min="0" max="3.5" step="0.05" value="2.2" />
+    </div>
+
+    <h2 style="margin-top:22px">3 · 贴合算法</h2>
+    <select id="algo"></select>
+    <p class="hint" id="algoDesc" style="margin-top:8px"></p>
+    <div id="algoParams"></div>
+
+    <button class="reset" id="reset">恢复默认</button>
+    <p class="hint" style="margin-top:18px">9 组锚点 [a,b] 从外侧点 b 沿 b−a 方向生成 3 个点（0.8/1.5/2.2 ×A），共 27 点；再用所选算法贴合到头表面。</p>
   </div>
 
   <div class="panel view">
@@ -94,6 +105,8 @@ import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 const $ = id => document.getElementById(id);
 let session = null;
+let meta = null;                 // {algos, labels, params, t_default}
+const paramState = {};           // algo -> {key: value}
 
 // ---- three.js setup ----
 const canvas = $('gl');
@@ -204,6 +217,59 @@ function drawWire2d() {
 
 function setWire3d(on) { wireframes.forEach(w => { w.visible = on; }); }
 
+// ---- control state ----
+function currentAlgo() { return $('algo').value || 'linear'; }
+
+function getControls() {
+  const algo = currentAlgo();
+  return {
+    t: [+$('t0').value, +$('t1').value, +$('t2').value],
+    algo,
+    params: { ...(paramState[algo] || {}) },
+  };
+}
+
+function buildAlgoUI() {
+  const sel = $('algo');
+  sel.innerHTML = '';
+  for (const a of meta.algos) {
+    const o = document.createElement('option');
+    o.value = a; o.textContent = meta.labels[a] || a;
+    sel.appendChild(o);
+  }
+  // seed defaults for every algo's params
+  for (const a of meta.algos) {
+    paramState[a] = {};
+    for (const s of (meta.params[a] || [])) paramState[a][s.key] = s.default;
+  }
+  renderAlgoParams();
+}
+
+function renderAlgoParams() {
+  const algo = currentAlgo();
+  $('algoDesc').textContent = meta.labels[algo] || '';
+  const box = $('algoParams');
+  box.innerHTML = '';
+  for (const s of (meta.params[algo] || [])) {
+    const wrap = document.createElement('div');
+    wrap.className = 'slider';
+    const v = paramState[algo][s.key];
+    wrap.innerHTML =
+      `<div class="row"><span>${s.label}</span>` +
+      `<span class="val" id="pv_${s.key}">${v.toFixed(2)}</span></div>`;
+    const inp = document.createElement('input');
+    inp.type = 'range'; inp.min = s.min; inp.max = s.max; inp.step = s.step;
+    inp.value = v;
+    inp.addEventListener('input', () => {
+      paramState[algo][s.key] = +inp.value;
+      $(`pv_${s.key}`).textContent = (+inp.value).toFixed(2);
+      update();
+    });
+    wrap.appendChild(inp);
+    box.appendChild(wrap);
+  }
+}
+
 // ---- networking ----
 function setStatus(msg, ok) { const s = $('status'); s.textContent = msg || ''; s.style.color = ok ? '#8d8' : '#f99'; }
 
@@ -214,10 +280,10 @@ async function upload(file) {
   const j = await r.json();
   if (!r.ok) { setStatus(j.error || '上传失败'); return; }
   session = j.session;
-  $('t1').value = j.t1; $('t2').value = j.t2; syncLabels();
+  if (j.meta) { meta = j.meta; buildAlgoUI(); }
   $('overlay').src = j.overlay;
   loadObj(j.obj);
-  setStatus('完成 · 拖动滑块实时调整', true);
+  setStatus('完成 · 切换算法 / 拖动滑块实时对比', true);
 }
 
 let timer = null;
@@ -227,7 +293,7 @@ async function update() {
   timer = setTimeout(async () => {
     const r = await fetch('/update', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session, t1: +$('t1').value, t2: +$('t2').value }),
+      body: JSON.stringify({ session, ...getControls() }),
     });
     const j = await r.json();
     if (!r.ok) { setStatus(j.error || '更新失败'); return; }
@@ -236,12 +302,30 @@ async function update() {
   }, 120);
 }
 
-function syncLabels() { $('t1v').textContent = (+$('t1').value).toFixed(2); $('t2v').textContent = (+$('t2').value).toFixed(2); }
+function syncLabels() {
+  $('t0v').textContent = (+$('t0').value).toFixed(2);
+  $('t1v').textContent = (+$('t1').value).toFixed(2);
+  $('t2v').textContent = (+$('t2').value).toFixed(2);
+}
+
+function resetDefaults() {
+  const td = (meta && meta.t_default) || [0.8, 1.5, 2.2];
+  $('t0').value = td[0]; $('t1').value = td[1]; $('t2').value = td[2];
+  syncLabels();
+  if (meta) {
+    for (const a of meta.algos)
+      for (const s of (meta.params[a] || [])) paramState[a][s.key] = s.default;
+    $('algo').value = 'linear';
+    renderAlgoParams();
+  }
+  update();
+}
 
 $('file').addEventListener('change', e => { if (e.target.files[0]) upload(e.target.files[0]); });
-$('t1').addEventListener('input', () => { syncLabels(); update(); });
-$('t2').addEventListener('input', () => { syncLabels(); update(); });
-$('reset').addEventListener('click', () => { $('t1').value = 0.8; $('t2').value = 1.6; syncLabels(); update(); });
+['t0', 't1', 't2'].forEach(id =>
+  $(id).addEventListener('input', () => { syncLabels(); update(); }));
+$('algo').addEventListener('change', () => { renderAlgoParams(); update(); });
+$('reset').addEventListener('click', resetDefaults);
 $('wire2d').addEventListener('change', drawWire2d);
 $('wire3d').addEventListener('change', e => setWire3d(e.target.checked));
 $('overlay').addEventListener('load', drawWire2d);

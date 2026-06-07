@@ -2,26 +2,29 @@
 
 Given 468 MediaPipe landmarks (pixel space) for an uploaded photo, place the
 468 base OBJ vertices at the matching landmark (via INDEX_MAP_468), then
-recompute the 18 extension vertices with the current t1/t2. The result is a
-486-vertex position array aligned to the photo, ready for the 2D overlay and
-the 3D viewer. UVs/faces are constant and come from the template.
+recompute the 27 extension vertices with the current ring multipliers ``t``
+and head-surface refinement ``algo``. The result is a 495-vertex position
+array aligned to the photo, ready for the 2D overlay and the 3D viewer.
+UVs/faces are constant and come from the template.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from .extend_mesh import N_NEW, T1_DEFAULT, T2_DEFAULT, compute_extension
+from .extend_mesh import N_NEW, T_DEFAULT, compute_extension
 from .index_map import INDEX_MAP_468
+from .refine import refine
 
 N_MP = 468
 
 
 def deform_positions(
     landmarks_px: np.ndarray,
-    t1: float = T1_DEFAULT,
-    t2: float = T2_DEFAULT,
+    t: tuple[float, ...] = T_DEFAULT,
+    algo: str = "linear",
+    params: dict | None = None,
 ) -> np.ndarray:
-    """Return (486, 3) positions in pixel space for the deformed mesh.
+    """Return (495, 3) positions in pixel space for the deformed mesh.
 
     ``landmarks_px`` is (468, 3): MediaPipe landmarks scaled to pixels
     (see landmarks.to_pixels). OBJ vertex i takes landmark INDEX_MAP_468[i].
@@ -29,7 +32,8 @@ def deform_positions(
     assert landmarks_px.shape[0] == N_MP, "expected 468 landmarks"
     idx = np.asarray(INDEX_MAP_468, dtype=np.int64)
     base = landmarks_px[idx].astype(np.float64)        # (468, 3) in OBJ order
-    new = compute_extension(base, t1, t2)              # (18, 3)
+    new = compute_extension(base, t)                   # (27, 3) raw rings
+    new = refine(base, new, t, algo, params)           # (27, 3) head-fitted
     return np.vstack([base, new])
 
 

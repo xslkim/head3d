@@ -7,8 +7,9 @@ PORT="${PORT:-18001}"
 PY=".venv/bin/python"
 [ -x "$PY" ] || PY="python3"
 
-# Build the extended template if missing.
-[ -f face_ext.obj ] || "$PY" build_template.py
+# Always rebuild the extended template so it stays in sync with the current
+# extension algorithm (27 points / 3 rings).
+"$PY" build_template.py
 
 ip=$(hostname -I 2>/dev/null | awk '{print $1}')
 echo "head3d -> http://localhost:${PORT}/  (LAN: http://${ip}:${PORT}/)"
