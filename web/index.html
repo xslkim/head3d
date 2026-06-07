@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>head3d · 人脸网格扩展</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 system-ui, sans-serif; background: #1b1d22; color: #e6e6e6; }
+  header { padding: 12px 18px; background: #23262d; border-bottom: 1px solid #333; }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header span { color: #8b9; }
+  .wrap { display: grid; grid-template-columns: 240px 1fr 1fr; gap: 14px; padding: 14px; }
+  .panel { background: #23262d; border: 1px solid #333; border-radius: 8px; padding: 14px; }
+  .panel h2 { margin: 0 0 10px; font-size: 13px; color: #9aa; text-transform: uppercase; letter-spacing: .04em; }
+  label.file { display: block; padding: 10px; text-align: center; background: #2f7d5b; border-radius: 6px; cursor: pointer; font-weight: 600; }
+  label.file input { display: none; }
+  .slider { margin: 16px 0; }
+  .slider .row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .slider .val { color: #7fd; font-variant-numeric: tabular-nums; }
+  input[type=range] { width: 100%; }
+  .view { display: flex; flex-direction: column; }
+  .view img, #gl { width: 100%; border-radius: 6px; background: #111; }
+  #gl { height: 560px; display: block; }
+  .status { margin-top: 8px; min-height: 18px; color: #f99; }
+  .hint { color: #889; font-size: 12px; }
+  button.reset { width: 100%; margin-top: 6px; padding: 7px; background: #3a3f48; color: #ddd; border: 1px solid #4a4f58; border-radius: 6px; cursor: pointer; }
+  .toolbar { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+  label.chk { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; color: #bcd; user-select: none; }
+  label.chk input { accent-color: #2f7d5b; }
+  .overlay-wrap { position: relative; line-height: 0; }
+  .overlay-wrap img { display: block; }
+  #wire2dCanvas { position: absolute; left: 0; top: 0; pointer-events: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>head3d <span>· MediaPipe 人脸网格扩展预览</span></h1>
+</header>
+
+<div class="wrap">
+  <div class="panel">
+    <h2>1 · 上传照片</h2>
+    <label class="file">选择人脸照片
+      <input id="file" type="file" accept="image/*" />
+    </label>
+    <div class="status" id="status"></div>
+
+    <h2 style="margin-top:22px">2 · 扩展参数</h2>
+    <div class="slider">
+      <div class="row"><span>t1 (内环 · 0.8A)</span><span class="val" id="t1v">0.80</span></div>
+      <input id="t1" type="range" min="0" max="2" step="0.05" value="0.8" />
+    </div>
+    <div class="slider">
+      <div class="row"><span>t2 (外环 · 1.6A)</span><span class="val" id="t2v">1.60</span></div>
+      <input id="t2" type="range" min="0" max="3" step="0.05" value="1.6" />
+    </div>
+    <button class="reset" id="reset">恢复默认 (0.8 / 1.6)</button>
+    <p class="hint" style="margin-top:18px">每组锚点 [a,b] 从外侧点 b 沿 b−a 方向生成两点：<br>b+t1·(b−a)、b+t2·(b−a)。</p>
+  </div>
+
+  <div class="panel view">
+    <h2>2D 叠加（服务端渲染）</h2>
+    <div class="toolbar">
+      <label class="chk"><input id="wire2d" type="checkbox" /> 显示线框</label>
+    </div>
+    <div class="overlay-wrap">
+      <img id="overlay" alt="上传照片后显示叠加结果" />
+      <canvas id="wire2dCanvas"></canvas>
+    </div>
+  </div>
+
+  <div class="panel view">
+    <h2>3D 视图（可旋转）</h2>
+    <div class="toolbar">
+      <label class="chk"><input id="wire3d" type="checkbox" /> 显示线框</label>
+    </div>
+    <canvas id="gl"></canvas>
+    <p class="hint">左键旋转 · 滚轮缩放 · 右键平移</p>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+
+const $ = id => document.getElementById(id);
+let session = null;
+
+// ---- three.js setup ----
+const canvas = $('gl');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111317);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 5000);
+camera.position.set(0, 0, 600);
+const controls = new OrbitControls(camera, canvas);
+scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+const texture = new THREE.TextureLoader().load('/texture');
+texture.colorSpace = THREE.SRGBColorSpace;
+let meshGroup = null;
+let wireframes = [];   // LineSegments overlays for the 3D view
+let objText = null;    // raw OBJ text, reused for the 2D wireframe
+
+function resize() {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w || canvas.height !== h) {
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+  }
+}
+function animate() { resize(); controls.update(); renderer.render(scene, camera); requestAnimationFrame(animate); }
+animate();
+
+function loadObj(text) {
+  objText = text;
+  if (meshGroup) { scene.remove(meshGroup); }
+  wireframes = [];
+  const obj = new OBJLoader().parse(text);
+  const mat = new THREE.MeshBasicMaterial({ map: texture, transparent: true, side: THREE.DoubleSide });
+
+  // OBJ is in image-pixel space (y down). Flip Y, then scale to fit.
+  obj.scale.y = -1;
+  let box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const s = 400 / Math.max(size.x, size.y, size.z);
+  obj.scale.multiplyScalar(s);
+
+  // Re-measure *after* scaling so we center on the true (scaled) center —
+  // translation is not affected by scale, so centering before scaling would
+  // leave the model off-origin and make it orbit (fly) around empty space.
+  obj.updateMatrixWorld(true);
+  box = new THREE.Box3().setFromObject(obj);
+  const center = box.getCenter(new THREE.Vector3());
+  obj.position.sub(center);
+
+  obj.traverse(c => {
+    if (!c.isMesh) return;
+    c.material = mat;
+    const wire = new THREE.LineSegments(
+      new THREE.WireframeGeometry(c.geometry),
+      new THREE.LineBasicMaterial({ color: 0x5affaa, transparent: true, opacity: 0.6 })
+    );
+    wire.visible = $('wire3d').checked;
+    c.add(wire);                 // child of the mesh: inherits its transform
+    wireframes.push(wire);
+  });
+
+  meshGroup = obj;
+  scene.add(obj);
+  controls.target.set(0, 0, 0); // model is centered at origin -> orbit stays put
+  controls.update();
+  drawWire2d();
+}
+
+// ---- wireframe toggles ----
+function parseObj(text) {
+  const verts = [], faces = [];
+  for (const line of text.split('\n')) {
+    if (line.startsWith('v ')) {
+      const p = line.split(/\s+/);
+      verts.push([parseFloat(p[1]), parseFloat(p[2])]);
+    } else if (line.startsWith('f ')) {
+      faces.push(line.trim().split(/\s+/).slice(1).map(t => parseInt(t.split('/')[0], 10) - 1));
+    }
+  }
+  return { verts, faces };
+}
+
+function drawWire2d() {
+  const cv = $('wire2dCanvas'), img = $('overlay');
+  const ctx = cv.getContext('2d');
+  if (!$('wire2d').checked || !objText || !img.naturalWidth || !img.clientWidth) {
+    cv.width = cv.height = 0;
+    return;
+  }
+  const cw = img.clientWidth, ch = img.clientHeight;
+  cv.width = cw; cv.height = ch;
+  cv.style.width = cw + 'px'; cv.style.height = ch + 'px';
+  const sx = cw / img.naturalWidth, sy = ch / img.naturalHeight;
+  const { verts, faces } = parseObj(objText);
+  ctx.clearRect(0, 0, cw, ch);
+  ctx.lineWidth = 0.6;
+  ctx.strokeStyle = 'rgba(90, 255, 170, 0.7)';
+  ctx.beginPath();
+  for (const f of faces) {
+    for (let i = 0; i < f.length; i++) {
+      const a = verts[f[i]], b = verts[f[(i + 1) % f.length]];
+      if (!a || !b) continue;
+      ctx.moveTo(a[0] * sx, a[1] * sy);
+      ctx.lineTo(b[0] * sx, b[1] * sy);
+    }
+  }
+  ctx.stroke();
+}
+
+function setWire3d(on) { wireframes.forEach(w => { w.visible = on; }); }
+
+// ---- networking ----
+function setStatus(msg, ok) { const s = $('status'); s.textContent = msg || ''; s.style.color = ok ? '#8d8' : '#f99'; }
+
+async function upload(file) {
+  setStatus('检测人脸中…', true);
+  const fd = new FormData(); fd.append('image', file);
+  const r = await fetch('/upload', { method: 'POST', body: fd });
+  const j = await r.json();
+  if (!r.ok) { setStatus(j.error || '上传失败'); return; }
+  session = j.session;
+  $('t1').value = j.t1; $('t2').value = j.t2; syncLabels();
+  $('overlay').src = j.overlay;
+  loadObj(j.obj);
+  setStatus('完成 · 拖动滑块实时调整', true);
+}
+
+let timer = null;
+async function update() {
+  if (!session) return;
+  clearTimeout(timer);
+  timer = setTimeout(async () => {
+    const r = await fetch('/update', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session, t1: +$('t1').value, t2: +$('t2').value }),
+    });
+    const j = await r.json();
+    if (!r.ok) { setStatus(j.error || '更新失败'); return; }
+    $('overlay').src = j.overlay;
+    loadObj(j.obj);
+  }, 120);
+}
+
+function syncLabels() { $('t1v').textContent = (+$('t1').value).toFixed(2); $('t2v').textContent = (+$('t2').value).toFixed(2); }
+
+$('file').addEventListener('change', e => { if (e.target.files[0]) upload(e.target.files[0]); });
+$('t1').addEventListener('input', () => { syncLabels(); update(); });
+$('t2').addEventListener('input', () => { syncLabels(); update(); });
+$('reset').addEventListener('click', () => { $('t1').value = 0.8; $('t2').value = 1.6; syncLabels(); update(); });
+$('wire2d').addEventListener('change', drawWire2d);
+$('wire3d').addEventListener('change', e => setWire3d(e.target.checked));
+$('overlay').addEventListener('load', drawWire2d);
+window.addEventListener('resize', drawWire2d);
+syncLabels();
+</script>
+</body>
+</html>

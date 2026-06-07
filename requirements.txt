@@ -1,0 +1,6 @@
+numpy>=1.24
+opencv-python>=4.8
+mediapipe>=0.10
+Flask>=3.0
+# matplotlib only needed for offline mesh-check scripts
+matplotlib>=3.7

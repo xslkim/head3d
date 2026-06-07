@@ -2,7 +2,33 @@
   "permissions": {
     "allow": [
       "WebSearch",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(awk '/^v /{v++} /^vt /{vt++} /^vn /{vn++} /^f /{f++} END{print \"v=\"v\" vt=\"vt\" vn=\"vn\" f=\"f}' face.obj)",
+      "Bash(awk '/^v /{n++; if\\(n==10||n==151||n==54||n==284\\) print n\": \"$0}' face.obj)",
+      "Bash(awk *)",
+      "Bash(git ls-tree *)",
+      "Bash(grep -E '\\\\.py$')",
+      "Bash(git show *)",
+      "Bash(cat)",
+      "Bash(python3 /tmp/check.py)",
+      "Bash(python3 -c \"from PIL import Image; im=Image.open\\('imgs/texture0.png'\\); print\\(im.size, im.mode\\)\")",
+      "Bash(python3 /tmp/v2.py)",
+      "Bash(.venv/bin/python -c \"import mediapipe,cv2,numpy,PIL,flask;print\\('mediapipe',mediapipe.__version__,'cv2',cv2.__version__\\)\")",
+      "Bash(mkdir -p python web)",
+      "Bash(.venv/bin/python -c \"import sys; sys.path.insert\\(0,'python'\\); from index_map import INDEX_MAP_468 as M; print\\('len',len\\(M\\),'min',min\\(M\\),'max',max\\(M\\),'unique',len\\(set\\(M\\)\\)\\)\")",
+      "Bash(.venv/bin/python *)",
+      "Bash(.venv/bin/python -m python.app --port 18001)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{size_download}b\\\\n\" http://127.0.0.1:18001/)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code} %{content_type}\\\\n\" http://127.0.0.1:18001/texture)",
+      "Read(//tmp/**)",
+      "Bash(pkill -f \"python.app\")",
+      "Bash(kill 42126)",
+      "Bash(kill -9 42126)",
+      "Bash(pkill -9 -f \"python.app\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(chmod +x start.sh)",
+      "Bash(./start.sh)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:18001/)"
     ]
   }
 }
