@@ -78,6 +78,50 @@ def compute_extension(
     return np.vstack(rings)
 
 
+def extension_uvs(
+    base_uv: np.ndarray,
+    center_v: float = 0.10,
+    v_top: float = 0.97,
+    u_lo: float = 0.03,
+    u_hi: float = 0.97,
+) -> np.ndarray:
+    """Smooth UV layout for the 27 extension points (doc: re-topology request).
+
+    Raw linear UV extrapolation (``b + t*(b-a)``) fans the points unevenly. The
+    canonical face UV leaves the strip ``v in [0.77, 1.0]`` empty above the
+    hairline, so instead we lay the three rings as **concentric arcs** radiating
+    from a centre ``(0.5, center_v)`` below the face: every ring point keeps its
+    anchor's radial direction and is pushed outward by a per-ring amount, giving
+    evenly-spaced, non-crossing, round arcs that fill the crown region.
+
+    Returns (27, 2), ring-major (matching ``compute_extension``).
+    """
+    _, b_obj = anchor_obj_indices()
+    B = base_uv[b_obj][:, :2]                 # (9, 2) top-edge anchor UVs
+    C = np.array([0.5, center_v])
+    vec = B - C
+    r = np.linalg.norm(vec, axis=1)
+    r[r == 0] = 1.0
+    d = vec / r[:, None]                      # outward unit direction per anchor
+
+    # Largest radial offset S that keeps every outer-ring point inside the
+    # margins (v <= v_top, u in [u_lo, u_hi]).
+    cand = []
+    for j in range(N_PAIRS):
+        if d[j, 1] > 1e-6:
+            cand.append((v_top - B[j, 1]) / d[j, 1])
+        if d[j, 0] > 1e-6:
+            cand.append((u_hi - B[j, 0]) / d[j, 0])
+        elif d[j, 0] < -1e-6:
+            cand.append((u_lo - B[j, 0]) / d[j, 0])
+    S = max(min(cand), 0.0)
+
+    t = np.asarray(T_DEFAULT, dtype=np.float64)
+    s = t / t.max()                           # ring spacing ratios
+    rings = [B + d * (s[k] * S) for k in range(N_RINGS)]
+    return np.vstack(rings)
+
+
 def ribbon_faces(n_base: int) -> list[tuple[int, int, int]]:
     """Triangle faces (vertex-id triples) stitching anchors -> ring0 -> ring1
     -> ring2.
@@ -135,8 +179,8 @@ def extend_obj_mesh(mesh: ObjMesh, t: tuple[float, ...] = T_DEFAULT) -> ObjMesh:
     pos = np.array(mesh.positions, dtype=np.float64)
     uv = np.array(mesh.texcoords, dtype=np.float64)
 
-    new_pos = compute_extension(pos, t)                  # (27, 3)
-    new_uv = compute_extension(uv, t)                    # (27, 2)
+    new_pos = compute_extension(pos, t)                  # (27, 3) linear
+    new_uv = extension_uvs(uv)                            # (27, 2) smooth arcs
 
     out = ObjMesh()
     out.header_lines = list(mesh.header_lines)
